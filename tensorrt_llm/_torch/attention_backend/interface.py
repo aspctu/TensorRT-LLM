@@ -37,7 +37,7 @@ class AttentionMetadata:
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None
 
-    is_mla: bool = False
+    enable_flash_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 

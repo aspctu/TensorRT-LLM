@@ -537,7 +537,7 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                is_mla=is_mla)
+                enable_flash_mla=self.model.model_config.enable_flash_mla)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -551,7 +551,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager=kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
-            is_mla=is_mla)
+            enable_flash_mla=self.model.model_config.enable_flash_mla)
+
         return self.attn_metadata
 
     def _set_up_spec_metadata(
@@ -562,14 +563,17 @@ class PyTorchModelEngine(ModelEngine):
             return get_spec_metadata(
                 self.spec_config,
                 self.batch_size,
-                spec_resource_manager=spec_resource_manager)
+                spec_resource_manager=spec_resource_manager,
+                enable_flash_mla=self.model.model_config.enable_flash_mla,
+                )
 
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
             self.spec_config,
             self.batch_size,
-            spec_resource_manager=spec_resource_manager)
+            spec_resource_manager=spec_resource_manager,
+            enable_flash_mla=self.model.model_config.enable_flash_mla)
         return self.spec_metadata
 
     def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
@@ -1112,6 +1116,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.kv_cache_manager = kv_cache_manager
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

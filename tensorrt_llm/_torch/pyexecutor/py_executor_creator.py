@@ -30,7 +30,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ._util import check_flash_mla_config, estimate_max_kv_cache_tokens, is_mla
+from ._util import estimate_max_kv_cache_tokens, is_mla
 
 
 def create_py_executor(executor_config: ExecutorConfig,
@@ -146,7 +146,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                 model_engine.model.config.num_hidden_layers))
         # has kv cache
         if is_mla(config):
-            if check_flash_mla_config(config):
+            if model_engine.model.model_config.enable_flash_mla:
                 executor_config.tokens_per_block = 64
                 logger.info(
                     f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
