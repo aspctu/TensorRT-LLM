@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
 
 import transformers
-
+import torch
 from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -47,6 +47,17 @@ class ModelConfig(Generic[TConfig]):
             return self.per_layer_quant_configs[name]
 
         raise ValueError(f'quant config of {name} is not found')
+    
+    @property
+    def enable_flash_mla(self):
+        if self.attn_backend == 'TRTLLM':
+            if hasattr(self.pretrained_config, "kv_lora_rank") and hasattr(
+                    self.pretrained_config, "qk_rope_head_dim"):
+                head_dim = self.pretrained_config.kv_lora_rank + self.pretrained_config.qk_rope_head_dim
+                if head_dim == 576 and torch.cuda.get_device_capability() == (
+                        9, 0):
+                    return True
+        return False
 
     @staticmethod
     def is_generation_model(model_architectures: Optional[List[str]]) -> bool:

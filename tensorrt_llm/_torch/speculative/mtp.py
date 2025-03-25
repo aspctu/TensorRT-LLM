@@ -8,7 +8,7 @@ from ..attention_backend import AttentionMetadata
 from ..pyexecutor.decoder import TorchDecoder
 from ..pyexecutor.llm_request import *
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
+from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager, KVCacheManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -98,6 +98,9 @@ class MTPSpecMetadata(SpecMetadata):
     slot_ids: Optional[torch.Tensor] = None
     # The index of the batche inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
+    
+    kv_cache_manager: Optional[KVCacheManager] = None
+    enable_flash_mla: bool = False
 
     def __post_init__(self) -> None:
         if self.mtp_hidden_states_manager is not None:
@@ -123,6 +126,7 @@ class MTPSpecMetadata(SpecMetadata):
             dtype=torch.int,
             device='cuda',
         )
+        self.block_ids_per_seq_mtp = None
 
     def prepare(self):
         assert self.request_ids is not None
@@ -136,6 +140,32 @@ class MTPSpecMetadata(SpecMetadata):
             self.num_tokens -= (self.num_generations) * self.mtp_num_modules
         else:
             self.num_tokens -= self.num_generations
+
+        if self.enable_flash_mla:
+            if self.kv_cache_manager is not None:
+                self.block_ids_per_seq_mtp = torch.zeros(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+                block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
+                    self.request_ids)
+                num_contexts = num_seqs - self.num_generations
+                reorder_block_ids_per_seq = torch.cat([
+                    block_ids_per_seq[num_contexts:num_contexts +
+                                      self.num_generations],
+                    block_ids_per_seq[:num_contexts]
+                ],
+                                                      dim=0)
+                self.block_ids_per_seq_mtp[:num_seqs, :block_ids_per_seq.
+                                           shape[1]].copy_(
+                                               reorder_block_ids_per_seq,
+                                               non_blocking=True)
+
+            
         # update mtp hidden states and past tokens
         if self.mtp_hidden_states_manager is not None:
             mtp_hidden_states_ptrs = []
@@ -969,6 +999,12 @@ class MTPEagleWorker(MTPWorker):
                 attn_metadata.num_contexts = 0
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
+            
+            if i == 0 and num_contexts > 0:
+                # for mtp eagle mode, mtp_layer_idx == 0: context attn; mtp_layer_idx > 0: generation attn
+                if attn_metadata.kv_cache_manager is not None:
+                    attn_metadata.block_ids_per_seq = spec_metadata.block_ids_per_seq_mtp
+
             # support attention dp
             if spec_metadata.all_rank_num_tokens is not None:
                 spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
