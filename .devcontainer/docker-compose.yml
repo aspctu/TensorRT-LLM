@@ -1,7 +1,7 @@
 version: "3.9"
 services:
   tensorrt_llm-dev:
-    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877
+    image: tensorrt_llm/devel:latest
 
     network_mode: host
     ipc: host
@@ -13,21 +13,19 @@ services:
     security_opt:
       - seccomp:unconfined
 
-    # Delete this section if you don't have a GPU.
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: 8
               capabilities: [gpu]
 
     volumes:
-      - ..:/workspaces/tensorrt_llm:cached
+      - ..:/workspaces/tensorrt_llm:cached,rw
 
     environment:
       - CCACHE_DIR=/workspaces/tensorrt_llm/cpp/.ccache
       - CCACHE_BASEDIR=/workspaces/tensorrt_llm
 
-    # Overrides default command so things don't shut down after the process ends.
-    command: /bin/sh -c "while sleep 1000; do :; done"
+    command: /bin/sh -c "chown -R ubuntu:ubuntu /workspaces/tensorrt_llm && while sleep 1000; do :; done"
