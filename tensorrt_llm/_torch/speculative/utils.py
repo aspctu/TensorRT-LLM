@@ -12,7 +12,6 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.num_nextn_predict_layers,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
-            mtp_hidden_states_manager=spec_resource_manager,
             enable_flash_mla=enable_flash_mla,
         )
     else:
