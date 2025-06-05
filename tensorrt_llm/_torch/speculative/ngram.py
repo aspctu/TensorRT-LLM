@@ -88,6 +88,7 @@ class NGramPoolManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Update pool and provide draft tokens for the requests
+        return
         for request in scheduled_batch.generation_requests:
             num_draft_tokens = 0 if request.py_last_draft_tokens is None else \
                 len(request.py_last_draft_tokens)
@@ -108,7 +109,7 @@ class NGramPoolManager(BaseResourceManager):
             if draft_tokens is not None:
                 pad_length = self.max_num_draft_tokens - len(draft_tokens)
                 draft_tokens.extend([request.py_end_id] * pad_length)
-            request.py_draft_tokens = draft_tokens
+            request.py_ngram_candidates = draft_tokens
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass

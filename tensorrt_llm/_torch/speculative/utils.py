@@ -3,6 +3,7 @@ from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramPoolManager
+from .hybrid import HybridSpeculativeDecodingWorker
 
 
 def get_spec_metadata(spec_config,
@@ -22,13 +23,29 @@ def get_spec_metadata(spec_config,
                                   max_num_requests=max_num_requests,
                                   num_layers=spec_config.num_layers,
                                   hidden_size=spec_config.hidden_size)
-    elif spec_config.spec_dec_mode.is_eagle3_one_model():
+    
+    elif spec_config.spec_dec_mode.is_hybrid():
+        num_layers = spec_config.eagle_config.num_layers
+        hidden_size = spec_config.eagle_config.hidden_size
+
         return Eagle3OneModelSpecMetadata(
             max_draft_tokens=spec_config.max_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
-            num_layers=spec_config.num_layers,
-            hidden_size=spec_config.hidden_size,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            max_num_tokens=max_num_tokens)
+
+    elif spec_config.spec_dec_mode.is_eagle3_one_model():
+        num_layers = spec_config.num_layers
+        hidden_size = spec_config.hidden_size
+
+        return Eagle3OneModelSpecMetadata(
+            max_draft_tokens=spec_config.max_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
             max_num_tokens=max_num_tokens)
     else:
         return None
@@ -48,6 +65,8 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
                                       max_num_requests)
     elif spec_config.spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
+    elif spec_config.spec_dec_mode.is_hybrid():
+        return NGramPoolManager(spec_config.ngram_config, max_num_requests)
     else:
         return None
 
@@ -59,6 +78,8 @@ def get_spec_decoder(max_seq_len, spec_config):
         return Eagle3Sampler(max_seq_len)
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelDecoder(max_seq_len, spec_config)
+    elif spec_config.spec_dec_mode.is_hybrid():
+        return Eagle3OneModelDecoder(max_seq_len, spec_config.eagle_config)
     else:
         return None
 
@@ -67,6 +88,8 @@ def get_num_spec_layers(spec_config):
     if spec_config.spec_dec_mode.is_mtp():
         return spec_config.num_nextn_predict_layers
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
+        return 1
+    elif spec_config.spec_dec_mode.is_hybrid(): 
         return 1
     else:
         return 0
@@ -77,6 +100,8 @@ def get_spec_worker(spec_config, mapping):
         return MTPWorker(spec_config)
     elif spec_config.spec_dec_mode.is_mtp_eagle():
         return MTPEagleWorker(spec_config)
+    elif spec_config.spec_dec_mode.is_hybrid():
+        return HybridSpeculativeDecodingWorker(spec_config, mapping)
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping)
     else:

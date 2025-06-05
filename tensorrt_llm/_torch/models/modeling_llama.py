@@ -870,7 +870,9 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
         self.is_eagle3_one_model = hasattr(
             model_config, "spec_config"
-        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        ) and model_config.spec_config is not None and (
+            model_config.spec_config.spec_dec_mode.is_eagle3_one_model()
+            or model_config.spec_config.spec_dec_mode.is_hybrid()
         )
         self.draft_model = None
         if self.is_eagle3_one_model:
@@ -1034,7 +1036,9 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
 
         self.is_eagle3_one_model = hasattr(
             model_config, "spec_config"
-        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        ) and model_config.spec_config is not None and (
+            model_config.spec_config.spec_dec_mode.is_eagle3_one_model()
+            or model_config.spec_config.spec_dec_mode.is_hybrid()
         )
         self.draft_model = None
         if self.is_eagle3_one_model:

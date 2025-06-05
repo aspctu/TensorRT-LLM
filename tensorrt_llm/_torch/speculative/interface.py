@@ -18,6 +18,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
     NONE = auto()
+    HYBRID = auto()
 
     def is_mtp(self):
         return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
@@ -32,19 +33,22 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
     def is_ngram(self):
-        return self == SpeculativeDecodingMode.NGRAM
+        return self == SpeculativeDecodingMode.NGRAM 
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
+    
+    def is_hybrid(self):
+        return self == SpeculativeDecodingMode.HYBRID
 
     def without_logits(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_hybrid()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_hybrid()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_hybrid()
 
     def has_draft_model(self):
         return self.is_eagle3()
@@ -54,10 +58,10 @@ class SpeculativeDecodingMode(IntEnum):
         Whether the draft model and target model are in the same model engine,
         and the draft model needs to load weights from the separate checkpoint.
         """
-        return self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_hybrid()
 
     def has_spec_decoder(self):
-        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model() or self.is_hybrid()
 
     def extend_ctx(self, attention_backend: AttentionBackend):
         """

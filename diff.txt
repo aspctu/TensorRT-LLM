@@ -1,0 +1,463 @@
+diff --git a/examples/pytorch/quickstart.py b/examples/pytorch/quickstart.py
+index 9c81a965e..d9265096c 100644
+--- a/examples/pytorch/quickstart.py
++++ b/examples/pytorch/quickstart.py
+@@ -1,17 +1,45 @@
+ from tensorrt_llm import SamplingParams
+ from tensorrt_llm._torch import LLM
+-
++from tensorrt_llm.llmapi import (EagleDecodingConfig, NGramDecodingConfig, HybridDecodingConfig, KvCacheConfig)
+ 
+ def main():
+     prompts = [
+         "Hello, my name is",
+-        "The president of the United States is",
+-        "The capital of France is",
+-        "The future of AI is",
+     ]
+     sampling_params = SamplingParams(max_tokens=32)
+ 
+-    llm = LLM(model='TinyLlama/TinyLlama-1.1B-Chat-v1.0')
++    eagle_config = EagleDecodingConfig(
++        max_draft_len=2,
++        pytorch_eagle_weights_path="/workspace/eagle"
++    )
++    
++    ngram_config = NGramDecodingConfig(
++        prompt_lookup_num_tokens=32,
++        max_matching_ngram_size=32,
++        is_keep_all=True,
++        is_use_oldest=True,
++        is_public_pool=True,
++    )
++
++    spec_config = HybridDecodingConfig(
++        eagle_config=eagle_config,
++        ngram_config=ngram_config,
++        max_eagle_potential_drafts=2,
++        max_ngram_potential_drafts=32,
++    )
++
++
++    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
++
++    # llm = LLM(model='TinyLlama/TinyLlama-1.1B-Chat-v1.0', backend="pytorch", tensor_parallel_size=1)
++    llm = LLM(
++        model="meta-llama/Meta-Llama-3-8B-Instruct",
++        backend="pytorch",
++        tensor_parallel_size=2,
++        # speculative_config=eagle_config,
++        speculative_config=spec_config,
++        kv_cache_config=kv_cache_config,
++    )
+     outputs = llm.generate(prompts, sampling_params)
+ 
+     for i, output in enumerate(outputs):
+diff --git a/tensorrt_llm/_torch/models/modeling_llama.py b/tensorrt_llm/_torch/models/modeling_llama.py
+index acd5a9f27..da41e627b 100644
+--- a/tensorrt_llm/_torch/models/modeling_llama.py
++++ b/tensorrt_llm/_torch/models/modeling_llama.py
+@@ -870,7 +870,9 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
+ 
+         self.is_eagle3_one_model = hasattr(
+             model_config, "spec_config"
+-        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
++        ) and model_config.spec_config is not None and (
++            model_config.spec_config.spec_dec_mode.is_eagle3_one_model()
++            or model_config.spec_config.spec_dec_mode.is_hybrid()
+         )
+         self.draft_model = None
+         if self.is_eagle3_one_model:
+@@ -1034,7 +1036,9 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
+ 
+         self.is_eagle3_one_model = hasattr(
+             model_config, "spec_config"
+-        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
++        ) and model_config.spec_config is not None and (
++            model_config.spec_config.spec_dec_mode.is_eagle3_one_model()
++            or model_config.spec_config.spec_dec_mode.is_hybrid()
+         )
+         self.draft_model = None
+         if self.is_eagle3_one_model:
+diff --git a/tensorrt_llm/_torch/pyexecutor/model_engine.py b/tensorrt_llm/_torch/pyexecutor/model_engine.py
+index f10fb292f..1e148481f 100644
+--- a/tensorrt_llm/_torch/pyexecutor/model_engine.py
++++ b/tensorrt_llm/_torch/pyexecutor/model_engine.py
+@@ -946,8 +946,10 @@ class PyTorchModelEngine(ModelEngine):
+ 
+                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                 ):
+-                    weights = load_weights(self.spec_config.draft_model_path,
+-                                           self.mapping)
++                    weights = load_weights(
++                        self.spec_config.draft_model_path,
++                        self.mapping
++                    )
+                     model.load_draft_weights(weights)
+ 
+             elif load_format == LoadFormat.DUMMY:
+diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor.py b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+index 61fb858b0..9e37c7086 100644
+--- a/tensorrt_llm/_torch/pyexecutor/py_executor.py
++++ b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+@@ -13,6 +13,7 @@ from collections import namedtuple
+ from contextlib import contextmanager
+ from itertools import chain
+ from typing import Dict, List, Optional, Tuple, Union
++import debugpy
+ 
+ import torch
+ 
+@@ -177,6 +178,16 @@ class PyExecutor:
+         self.global_rank = global_mpi_rank()
+         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
+ 
++        # if self.global_rank == 1:
++        #     # check that we haven't already started a debugpy server
++        #     if not debugpy.is_client_connected():
++        #         print(f"[DEBUG] PyExecutor Rank {self.global_rank} starting debugpy server.")
++        #         debug_port = 5678
++        #         debugpy.listen(("0.0.0.0", debug_port))
++        #         print(f"[DEBUG] PyExecutor Rank {self.global_rank} waiting for debugger to attach on port {debug_port}...")
++        #         debugpy.wait_for_client()
++        #         print(f"[DEBUG] PyExecutor Rank {self.global_rank} debugger attached!")
++
+         # profile config
+         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
+             PROFILE_START_STOP_ENV_VAR_NAME)
+diff --git a/tensorrt_llm/_torch/speculative/__init__.py b/tensorrt_llm/_torch/speculative/__init__.py
+index b1fb18cf1..95bbf6eec 100644
+--- a/tensorrt_llm/_torch/speculative/__init__.py
++++ b/tensorrt_llm/_torch/speculative/__init__.py
+@@ -2,6 +2,7 @@ from .eagle3 import Eagle3Config, Eagle3SpecMetadata
+ from .interface import SpecConfig, SpecMetadata
+ from .mtp import MTPConfig, MTPEagleWorker, MTPSpecMetadata, MTPWorker
+ from .ngram import NGramConfig
++from .hybrid import HybridSpecConfig, HybridSpeculativeDecodingWorker
+ from .utils import (get_num_spec_layers, get_spec_decoder, get_spec_metadata,
+                     get_spec_resource_manager, get_spec_worker)
+ 
+@@ -9,5 +10,6 @@ __all__ = [
+     "SpecConfig", "SpecMetadata", "MTPConfig", "MTPEagleWorker",
+     "MTPSpecMetadata", "MTPWorker", "Eagle3Config", "Eagle3SpecMetadata",
+     "get_spec_metadata", "get_spec_resource_manager", "get_spec_decoder",
+-    "get_num_spec_layers", "get_spec_worker", "NGramConfig"
++    "get_num_spec_layers", "get_spec_worker", "NGramConfig", "HybridSpecConfig",
++    "HybridSpeculativeDecodingWorker"
+ ]
+diff --git a/tensorrt_llm/_torch/speculative/eagle3.py b/tensorrt_llm/_torch/speculative/eagle3.py
+index 67aec85c4..de9d2bb75 100644
+--- a/tensorrt_llm/_torch/speculative/eagle3.py
++++ b/tensorrt_llm/_torch/speculative/eagle3.py
+@@ -281,12 +281,17 @@ class Eagle3OneModelWorker(nn.Module):
+             draft_model=draft_model)
+ 
+         # Predict draft tokens
++        if hasattr(self.spec_config, 'eagle_config') and self.spec_config.eagle_config is not None:
++            num_draft_tokens_for_eagle_generation = self.spec_config.eagle_config.max_draft_tokens
++        else:
++            num_draft_tokens_for_eagle_generation = self.max_draft_tokens
++
+         next_draft_tokens = []
+-        for i in range(self.max_draft_tokens):
++        for i in range(num_draft_tokens_for_eagle_generation):
+             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+             if i == 0:
+                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
+-                                 (self.max_draft_tokens + 1)).long()
++                                 (num_draft_tokens_for_eagle_generation + 1)).long()
+                 gather_ids_gen = (start_ids_gen +
+                                   num_accepted_tokens[num_contexts:] - 1 +
+                                   attn_metadata.num_ctx_tokens)
+diff --git a/tensorrt_llm/_torch/speculative/interface.py b/tensorrt_llm/_torch/speculative/interface.py
+index d3fc6d48e..d5dafef01 100644
+--- a/tensorrt_llm/_torch/speculative/interface.py
++++ b/tensorrt_llm/_torch/speculative/interface.py
+@@ -18,6 +18,7 @@ class SpeculativeDecodingMode(IntEnum):
+     EAGLE3_ONE_MODEL = auto()
+     NGRAM = auto()
+     NONE = auto()
++    HYBRID = auto()
+ 
+     def is_mtp(self):
+         return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
+@@ -32,19 +33,22 @@ class SpeculativeDecodingMode(IntEnum):
+         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+ 
+     def is_ngram(self):
+-        return self == SpeculativeDecodingMode.NGRAM
++        return self == SpeculativeDecodingMode.NGRAM 
+ 
+     def is_none(self):
+         return self == SpeculativeDecodingMode.NONE
++    
++    def is_hybrid(self):
++        return self == SpeculativeDecodingMode.HYBRID
+ 
+     def without_logits(self):
+-        return self.is_mtp() or self.is_eagle3_one_model()
++        return self.is_mtp() or self.is_eagle3_one_model() or self.is_hybrid()
+ 
+     def needs_kv_cache_rewind(self):
+-        return self.is_mtp() or self.is_eagle3_one_model()
++        return self.is_mtp() or self.is_eagle3_one_model() or self.is_hybrid()
+ 
+     def support_overlap_scheduler(self):
+-        return self.is_mtp() or self.is_eagle3_one_model()
++        return self.is_mtp() or self.is_eagle3_one_model() or self.is_hybrid()
+ 
+     def has_draft_model(self):
+         return self.is_eagle3()
+@@ -54,10 +58,10 @@ class SpeculativeDecodingMode(IntEnum):
+         Whether the draft model and target model are in the same model engine,
+         and the draft model needs to load weights from the separate checkpoint.
+         """
+-        return self.is_eagle3_one_model()
++        return self.is_eagle3_one_model() or self.is_hybrid()
+ 
+     def has_spec_decoder(self):
+-        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
++        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model() or self.is_hybrid()
+ 
+     def extend_ctx(self, attention_backend: AttentionBackend):
+         """
+diff --git a/tensorrt_llm/_torch/speculative/ngram.py b/tensorrt_llm/_torch/speculative/ngram.py
+index 9abd4d5de..f520caa43 100644
+--- a/tensorrt_llm/_torch/speculative/ngram.py
++++ b/tensorrt_llm/_torch/speculative/ngram.py
+@@ -88,6 +88,7 @@ class NGramPoolManager(BaseResourceManager):
+ 
+     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+         # Update pool and provide draft tokens for the requests
++        return
+         for request in scheduled_batch.generation_requests:
+             num_draft_tokens = 0 if request.py_last_draft_tokens is None else \
+                 len(request.py_last_draft_tokens)
+@@ -108,7 +109,7 @@ class NGramPoolManager(BaseResourceManager):
+             if draft_tokens is not None:
+                 pad_length = self.max_num_draft_tokens - len(draft_tokens)
+                 draft_tokens.extend([request.py_end_id] * pad_length)
+-            request.py_draft_tokens = draft_tokens
++            request.py_ngram_candidates = draft_tokens
+ 
+     def update_resources(self, scheduled_batch: ScheduledRequests):
+         pass
+diff --git a/tensorrt_llm/_torch/speculative/utils.py b/tensorrt_llm/_torch/speculative/utils.py
+index ed7e433cc..178f6f499 100644
+--- a/tensorrt_llm/_torch/speculative/utils.py
++++ b/tensorrt_llm/_torch/speculative/utils.py
+@@ -3,6 +3,7 @@ from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
+ from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
+                   MTPSpecMetadata, MTPWorker)
+ from .ngram import NGramPoolManager
++from .hybrid import HybridSpeculativeDecodingWorker
+ 
+ 
+ def get_spec_metadata(spec_config,
+@@ -22,13 +23,29 @@ def get_spec_metadata(spec_config,
+                                   max_num_requests=max_num_requests,
+                                   num_layers=spec_config.num_layers,
+                                   hidden_size=spec_config.hidden_size)
++    
++    elif spec_config.spec_dec_mode.is_hybrid():
++        num_layers = spec_config.eagle_config.num_layers
++        hidden_size = spec_config.eagle_config.hidden_size
++
++        return Eagle3OneModelSpecMetadata(
++            max_draft_tokens=spec_config.max_draft_tokens,
++            spec_dec_mode=spec_config.spec_dec_mode,
++            max_num_requests=max_num_requests,
++            num_layers=num_layers,
++            hidden_size=hidden_size,
++            max_num_tokens=max_num_tokens)
++
+     elif spec_config.spec_dec_mode.is_eagle3_one_model():
++        num_layers = spec_config.num_layers
++        hidden_size = spec_config.hidden_size
++
+         return Eagle3OneModelSpecMetadata(
+             max_draft_tokens=spec_config.max_draft_tokens,
+             spec_dec_mode=spec_config.spec_dec_mode,
+             max_num_requests=max_num_requests,
+-            num_layers=spec_config.num_layers,
+-            hidden_size=spec_config.hidden_size,
++            num_layers=num_layers,
++            hidden_size=hidden_size,
+             max_num_tokens=max_num_tokens)
+     else:
+         return None
+@@ -48,6 +65,8 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
+                                       max_num_requests)
+     elif spec_config.spec_dec_mode.is_ngram():
+         return NGramPoolManager(spec_config, max_num_requests)
++    elif spec_config.spec_dec_mode.is_hybrid():
++        return NGramPoolManager(spec_config.ngram_config, max_num_requests)
+     else:
+         return None
+ 
+@@ -59,6 +78,8 @@ def get_spec_decoder(max_seq_len, spec_config):
+         return Eagle3Sampler(max_seq_len)
+     elif spec_config.spec_dec_mode.is_eagle3_one_model():
+         return Eagle3OneModelDecoder(max_seq_len, spec_config)
++    elif spec_config.spec_dec_mode.is_hybrid():
++        return Eagle3OneModelDecoder(max_seq_len, spec_config.eagle_config)
+     else:
+         return None
+ 
+@@ -68,6 +89,8 @@ def get_num_spec_layers(spec_config):
+         return spec_config.num_nextn_predict_layers
+     elif spec_config.spec_dec_mode.is_eagle3_one_model():
+         return 1
++    elif spec_config.spec_dec_mode.is_hybrid(): 
++        return 1
+     else:
+         return 0
+ 
+@@ -77,6 +100,8 @@ def get_spec_worker(spec_config, mapping):
+         return MTPWorker(spec_config)
+     elif spec_config.spec_dec_mode.is_mtp_eagle():
+         return MTPEagleWorker(spec_config)
++    elif spec_config.spec_dec_mode.is_hybrid():
++        return HybridSpeculativeDecodingWorker(spec_config, mapping)
+     elif spec_config.spec_dec_mode.is_eagle3_one_model():
+         return Eagle3OneModelWorker(spec_config, mapping)
+     else:
+diff --git a/tensorrt_llm/llmapi/__init__.py b/tensorrt_llm/llmapi/__init__.py
+index afd2bb9d3..145718a88 100644
+--- a/tensorrt_llm/llmapi/__init__.py
++++ b/tensorrt_llm/llmapi/__init__.py
+@@ -5,7 +5,7 @@ from .build_cache import BuildCacheConfig
+ from .llm import LLM, RequestOutput
+ from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
+                        CapacitySchedulerPolicy, ContextChunkingPolicy,
+-                       DynamicBatchConfig, EagleDecodingConfig,
++                       DynamicBatchConfig, EagleDecodingConfig, HybridDecodingConfig,
+                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+                        LookaheadDecodingConfig, MedusaDecodingConfig,
+                        MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+@@ -26,6 +26,7 @@ __all__ = [
+     'LookaheadDecodingConfig',
+     'MedusaDecodingConfig',
+     'EagleDecodingConfig',
++    'HybridDecodingConfig'
+     'MTPDecodingConfig',
+     'SchedulerConfig',
+     'CapacitySchedulerPolicy',
+diff --git a/tensorrt_llm/llmapi/llm_args.py b/tensorrt_llm/llmapi/llm_args.py
+index 0835058ed..0eeaecba4 100644
+--- a/tensorrt_llm/llmapi/llm_args.py
++++ b/tensorrt_llm/llmapi/llm_args.py
+@@ -207,6 +207,7 @@ class DecodingBaseConfig(BaseModel):
+             "Eagle": EagleDecodingConfig,
+             "Lookahead": LookaheadDecodingConfig,
+             "NGram": NGramDecodingConfig,
++            "Hybrid": HybridDecodingConfig,
+         }
+ 
+         config_class = config_classes.get(decoding_type)
+@@ -294,6 +295,18 @@ class MTPDecodingConfig(DecodingBaseConfig):
+ 
+     decoding_type: ClassVar[str] = "MTP"
+ 
++class HybridDecodingConfig(DecodingBaseConfig):
++    eagle_config: Optional[EagleDecodingConfig] = None
++    ngram_config: Optional[NGramDecodingConfig] = None
++    max_eagle_potential_drafts: int = 3
++    max_ngram_potential_drafts: int = 5
++    max_draft_len: Optional[int] = 1
++
++    @classmethod
++    def from_dict(cls, data: dict):
++        return cls(**data)
++
++    decoding_type: ClassVar[str] = "Hybrid"
+ 
+ class PybindMirror(ABC):
+     ''' A class containing the utilities for mirroring Python classes to
+@@ -896,7 +909,7 @@ class BaseLlmArgs(BaseModel):
+     # Speculative decoding parameters
+     speculative_config: Optional[Union[
+         LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
+-        MTPDecodingConfig, NGramDecodingConfig]] = Field(
++        MTPDecodingConfig, NGramDecodingConfig, HybridDecodingConfig]] = Field(
+             default=None, description="Speculative decoding config.")
+ 
+     batching_type: Optional[BatchingType] = Field(default=None,
+@@ -1163,6 +1176,24 @@ class BaseLlmArgs(BaseModel):
+             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
+ 
+     def _setup_speculative_config(self):
++        def _setup_eagle_config(eagle_config: EagleDecodingConfig):
++            from tensorrt_llm._torch.speculative import Eagle3Config
++            print(f"Eagle weights draft path is {eagle_config.pytorch_eagle_weights_path}")
++            return Eagle3Config(
++                max_draft_tokens=self.speculative_config.max_draft_len,
++                draft_model_path=eagle_config.pytorch_eagle_weights_path,
++            )
++    
++        def _setup_ngram_config(ngram_config: NGramDecodingConfig):
++            from tensorrt_llm._torch.speculative import NGramConfig
++            return NGramConfig(
++                prompt_lookup_num_tokens=ngram_config.prompt_lookup_num_tokens,
++                max_matching_ngram_size=ngram_config.max_matching_ngram_size,
++                is_keep_all=ngram_config.is_keep_all,
++                is_use_oldest=ngram_config.is_use_oldest,
++                is_public_pool=ngram_config.is_public_pool,
++            )
++
+         if self.speculative_config:
+             if isinstance(self.speculative_config, LookaheadDecodingConfig):
+                 lookahead_config = self.speculative_config
+@@ -1202,27 +1233,36 @@ class BaseLlmArgs(BaseModel):
+                         decoding_mode=DecodingMode.Eagle(),
+                         eagle_config=eagle_config)
+                 else:
+-                    from tensorrt_llm._torch.speculative import Eagle3Config
+-                    self.speculative_config = Eagle3Config(
+-                        max_draft_tokens=self.speculative_config.max_draft_len,
+-                        draft_model_path=self.speculative_config.
+-                        pytorch_eagle_weights_path,
+-                        eagle3_one_model=self.speculative_config.
+-                        eagle3_one_model)
++                    self.speculative_config = _setup_eagle_config(
++                        self.speculative_config)
+             elif isinstance(self.speculative_config, NGramDecodingConfig):
+                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
+                 assert self.backend == 'pytorch'
+                 assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
+                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
+-                from tensorrt_llm._torch.speculative import NGramConfig
+-                self.speculative_config = NGramConfig(
+-                    prompt_lookup_num_tokens=self.speculative_config.
+-                    prompt_lookup_num_tokens,
+-                    max_matching_ngram_size=self.speculative_config.
+-                    max_matching_ngram_size,
+-                    is_keep_all=self.speculative_config.is_keep_all,
+-                    is_use_oldest=self.speculative_config.is_use_oldest,
+-                    is_public_pool=self.speculative_config.is_public_pool,
++                self.speculative_config = _setup_ngram_config(
++                    self.speculative_config)
++            elif isinstance(self.speculative_config, HybridDecodingConfig):
++                from tensorrt_llm._torch.speculative import HybridSpecConfig
++                assert self.backend == 'pytorch'
++
++                # TODO(Abu): check what this enum does / how it might affect the cpp side. 
++                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
++
++                eagle_config = self.speculative_config.eagle_config
++                ngram_config = self.speculative_config.ngram_config
++
++                eagle_config = _setup_eagle_config(eagle_config)
++                ngram_config = _setup_ngram_config(ngram_config)
++
++                assert eagle_config is not None
++                assert ngram_config is not None
++
++                self.speculative_config = HybridSpecConfig(
++                    eagle_config=eagle_config,
++                    ngram_config=ngram_config,
++                    max_eagle_potential_drafts=eagle_config.max_draft_tokens,
++                    max_ngram_potential_drafts=ngram_config.max_matching_ngram_size,
+                 )
+             elif isinstance(self.speculative_config, MTPDecodingConfig):
+                 from tensorrt_llm._torch.speculative import MTPConfig

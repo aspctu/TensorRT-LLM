@@ -5,7 +5,7 @@ from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
-                       DynamicBatchConfig, EagleDecodingConfig,
+                       DynamicBatchConfig, EagleDecodingConfig, HybridDecodingConfig,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
@@ -26,6 +26,7 @@ __all__ = [
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'EagleDecodingConfig',
+    'HybridDecodingConfig'
     'MTPDecodingConfig',
     'SchedulerConfig',
     'CapacitySchedulerPolicy',

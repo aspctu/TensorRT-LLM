@@ -207,6 +207,7 @@ class DecodingBaseConfig(BaseModel):
             "Eagle": EagleDecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
+            "Hybrid": HybridDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -294,6 +295,18 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     decoding_type: ClassVar[str] = "MTP"
 
+class HybridDecodingConfig(DecodingBaseConfig):
+    eagle_config: Optional[EagleDecodingConfig] = None
+    ngram_config: Optional[NGramDecodingConfig] = None
+    max_eagle_potential_drafts: int = 3
+    max_ngram_potential_drafts: int = 5
+    max_draft_len: Optional[int] = 1
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "Hybrid"
 
 class PybindMirror(ABC):
     ''' A class containing the utilities for mirroring Python classes to
@@ -896,7 +909,7 @@ class BaseLlmArgs(BaseModel):
     # Speculative decoding parameters
     speculative_config: Optional[Union[
         LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig, NGramDecodingConfig]] = Field(
+        MTPDecodingConfig, NGramDecodingConfig, HybridDecodingConfig]] = Field(
             default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
@@ -1163,6 +1176,23 @@ class BaseLlmArgs(BaseModel):
             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
 
     def _setup_speculative_config(self):
+        def _setup_eagle_config(eagle_config: EagleDecodingConfig):
+            from tensorrt_llm._torch.speculative import Eagle3Config
+            return Eagle3Config(
+                max_draft_tokens=self.speculative_config.max_draft_len,
+                draft_model_path=eagle_config.pytorch_eagle_weights_path,
+            )
+    
+        def _setup_ngram_config(ngram_config: NGramDecodingConfig):
+            from tensorrt_llm._torch.speculative import NGramConfig
+            return NGramConfig(
+                prompt_lookup_num_tokens=ngram_config.prompt_lookup_num_tokens,
+                max_matching_ngram_size=ngram_config.max_matching_ngram_size,
+                is_keep_all=ngram_config.is_keep_all,
+                is_use_oldest=ngram_config.is_use_oldest,
+                is_public_pool=ngram_config.is_public_pool,
+            )
+
         if self.speculative_config:
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
                 lookahead_config = self.speculative_config
@@ -1202,27 +1232,36 @@ class BaseLlmArgs(BaseModel):
                         decoding_mode=DecodingMode.Eagle(),
                         eagle_config=eagle_config)
                 else:
-                    from tensorrt_llm._torch.speculative import Eagle3Config
-                    self.speculative_config = Eagle3Config(
-                        max_draft_tokens=self.speculative_config.max_draft_len,
-                        draft_model_path=self.speculative_config.
-                        pytorch_eagle_weights_path,
-                        eagle3_one_model=self.speculative_config.
-                        eagle3_one_model)
+                    self.speculative_config = _setup_eagle_config(
+                        self.speculative_config)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 assert self.backend == 'pytorch'
                 assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
-                from tensorrt_llm._torch.speculative import NGramConfig
-                self.speculative_config = NGramConfig(
-                    prompt_lookup_num_tokens=self.speculative_config.
-                    prompt_lookup_num_tokens,
-                    max_matching_ngram_size=self.speculative_config.
-                    max_matching_ngram_size,
-                    is_keep_all=self.speculative_config.is_keep_all,
-                    is_use_oldest=self.speculative_config.is_use_oldest,
-                    is_public_pool=self.speculative_config.is_public_pool,
+                self.speculative_config = _setup_ngram_config(
+                    self.speculative_config)
+            elif isinstance(self.speculative_config, HybridDecodingConfig):
+                from tensorrt_llm._torch.speculative import HybridSpecConfig
+                assert self.backend == 'pytorch'
+
+                # TODO(Abu): check what this enum does / how it might affect the cpp side. 
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
+
+                eagle_config = self.speculative_config.eagle_config
+                ngram_config = self.speculative_config.ngram_config
+
+                eagle_config = _setup_eagle_config(eagle_config)
+                ngram_config = _setup_ngram_config(ngram_config)
+
+                assert eagle_config is not None
+                assert ngram_config is not None
+
+                self.speculative_config = HybridSpecConfig(
+                    eagle_config=eagle_config,
+                    ngram_config=ngram_config,
+                    max_eagle_potential_drafts=eagle_config.max_draft_tokens,
+                    max_ngram_potential_drafts=ngram_config.max_matching_ngram_size,
                 )
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig

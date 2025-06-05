@@ -281,12 +281,17 @@ class Eagle3OneModelWorker(nn.Module):
             draft_model=draft_model)
 
         # Predict draft tokens
+        if hasattr(self.spec_config, 'eagle_config') and self.spec_config.eagle_config is not None:
+            num_draft_tokens_for_eagle_generation = self.spec_config.eagle_config.max_draft_tokens
+        else:
+            num_draft_tokens_for_eagle_generation = self.max_draft_tokens
+
         next_draft_tokens = []
-        for i in range(self.max_draft_tokens):
+        for i in range(num_draft_tokens_for_eagle_generation):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
-                                 (self.max_draft_tokens + 1)).long()
+                                 (num_draft_tokens_for_eagle_generation + 1)).long()
                 gather_ids_gen = (start_ids_gen +
                                   num_accepted_tokens[num_contexts:] - 1 +
                                   attn_metadata.num_ctx_tokens)

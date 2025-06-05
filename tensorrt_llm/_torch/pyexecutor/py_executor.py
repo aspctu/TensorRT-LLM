@@ -13,6 +13,7 @@ from collections import namedtuple
 from contextlib import contextmanager
 from itertools import chain
 from typing import Dict, List, Optional, Tuple, Union
+import debugpy
 
 import torch
 
@@ -176,6 +177,16 @@ class PyExecutor:
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
+
+        # if self.global_rank == 1:
+        #     # check that we haven't already started a debugpy server
+        #     if not debugpy.is_client_connected():
+        #         print(f"[DEBUG] PyExecutor Rank {self.global_rank} starting debugpy server.")
+        #         debug_port = 5678
+        #         debugpy.listen(("0.0.0.0", debug_port))
+        #         print(f"[DEBUG] PyExecutor Rank {self.global_rank} waiting for debugger to attach on port {debug_port}...")
+        #         debugpy.wait_for_client()
+        #         print(f"[DEBUG] PyExecutor Rank {self.global_rank} debugger attached!")
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
