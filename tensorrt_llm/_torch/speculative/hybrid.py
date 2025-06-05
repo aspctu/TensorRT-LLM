@@ -51,9 +51,11 @@ def merge_eagle_and_ngram(
     print(f"Proposed Eagle draft: {eagle}")
     print(f"Proposed NGram draft: {ngram}")
     if not eagle:
-        return ngram[:max_len] if ngram else []
+        draft = ngram[:max_len] if ngram else []
+        print(f"Returning the following as draft: {draft}") 
     if not ngram:
-        return eagle[:max_len]
+        draft = eagle[:max_len]
+        print(f"Returning the following as draft: {draft}")
 
     if stop_on_first_mismatch:
         merged: list[int] = []
@@ -75,7 +77,7 @@ class HybridSpeculativeDecodingWorker(Eagle3OneModelWorker):
             _MAX_NUM_REQUESTS
         )
         self._max_seq_len = _MAX_SEQUENCE_LENGTH
-        self.eos_token_id = 1 # TODO(Abu): Plumb this through correctly
+        self.eos_token_id = 128001 # TODO(Abu): Plumb this through correctly
 
     def forward(self, input_ids, position_ids, hidden_states, logits,
                 attn_metadata, spec_metadata, draft_model):
