@@ -1,15 +1,17 @@
 from abc import ABC, abstractmethod
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from typing import Optional, Tuple
 
 from strenum import StrEnum
 
+from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
-from .llm_request import LlmRequest, LlmRequestState
+from .llm_request import LlmRequest, LlmRequestState, resolve_priority
 
 RequestList = list[LlmRequest]
+DEFAULT_PRIORITY = float(getattr(tllm_executor.Request, "kDefaultPriority", 0.5))
 
 SchedulerOutput = namedtuple("SchedulerOutput", [
     "context_requests", "generation_requests", "paused_requests",
@@ -112,6 +114,9 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
+        # NOTE: Abu: The order of requests is prioritized such that request list coming from the priority
+        # scheduler are first scheduled.
+        # TODO: Abu: How do we handle starvation of low priority requests here?
         scheduled_requests = []
         pending_requests = []
         reserved_blocks = 0
@@ -216,3 +221,77 @@ class SimpleScheduler(RequestScheduler):
                                list(generation_requests), list(paused_requests),
                                list(fitting_disagg_gen_init_requests),
                                len(fitting_requests))
+
+
+class PrioritySimpleScheduler(RequestScheduler):
+
+    def __init__(self, capacity_scheduler: CapacityScheduler,
+                 micro_batch_scheduler: MicroBatchScheduler,
+                 *, min_priority: float = 1e-3):
+        super().__init__()
+        self.capacity_scheduler = capacity_scheduler
+        self.micro_batch_scheduler = micro_batch_scheduler
+        self._min_priority = min_priority
+
+    def _weighted_order(self, requests: RequestList) -> RequestList:
+        if not requests:
+            return requests
+
+        priorities = [
+            resolve_priority(req) for req in requests
+        ]
+        if not any(priority is not None for priority in priorities):
+            return requests
+
+        groups: dict[float, list[LlmRequest]] = defaultdict(list)
+        for req, priority in zip(requests, priorities):
+            weight = DEFAULT_PRIORITY if priority is None else float(priority)
+            weight = max(weight, self._min_priority)
+            groups[weight].append(req)
+
+        credits = {weight: 0.0 for weight in groups}
+        ordered: list[LlmRequest] = []
+        # Weighted round-robin scheduling
+        while groups:
+            progress_made = False
+            empty_weights = []
+            for weight in sorted(list(groups.keys()), reverse=True):
+                credits[weight] += weight
+                if credits[weight] >= 1.0:
+                    credits[weight] -= 1.0
+                    bucket = groups[weight]
+                    ordered.append(bucket.pop(0))
+                    progress_made = True
+                    if not bucket:
+                        empty_weights.append(weight)
+                    if len(ordered) == len(requests):
+                        break
+            for weight in empty_weights:
+                del groups[weight]
+                del credits[weight]
+            if len(ordered) == len(requests):
+                break
+            if not progress_made:
+                for weight in sorted(groups.keys(), reverse=True):
+                    ordered.extend(groups[weight])
+                break
+        return ordered
+
+    def schedule_request(self, active_requests: RequestList,
+                         inflight_request_ids: set[int]) -> SchedulerOutput:
+        ordered_active = self._weighted_order(active_requests)
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
+            ordered_active
+        )
+
+        ordered_fitting = self._weighted_order(fitting_requests)
+        context_requests, generation_requests = self.micro_batch_scheduler.schedule(
+            ordered_fitting, inflight_request_ids)
+
+        return SchedulerOutput(
+            list(context_requests),
+            list(generation_requests),
+            list(paused_requests),
+            list(fitting_disagg_gen_init_requests),
+            len(ordered_fitting),
+        )

@@ -6,7 +6,6 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
@@ -40,7 +39,7 @@ from .resource_manager import (KVCacheManager, PeftCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        SimpleScheduler)
+                        PrioritySimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -780,7 +779,7 @@ def create_py_executor_instance(
         two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                            ctx_chunk_config)
-    scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
+    scheduler = PrioritySimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(

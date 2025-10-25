@@ -341,6 +341,7 @@ class BaseLLM:
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
+        priority: Optional[float] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -356,6 +357,7 @@ class BaseLLM:
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
+            priority (float, optional): Optional request priority. Higher values receive preferential scheduling.
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
@@ -491,6 +493,7 @@ class BaseLLM:
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
+            priority=priority,
         )
 
         return RequestOutput._from_generation_result(result, prompt,

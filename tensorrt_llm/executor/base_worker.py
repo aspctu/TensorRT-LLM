@@ -439,6 +439,10 @@ class BaseWorker(GenerationExecutor):
             return max_tokens
 
         try:
+            request_kwargs = {}
+            if request.priority is not None:
+                request_kwargs["priority"] = float(request.priority)
+
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
@@ -478,7 +482,8 @@ class BaseWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id)
+                cache_salt_id=request.cache_salt_id,
+                **request_kwargs)
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
 

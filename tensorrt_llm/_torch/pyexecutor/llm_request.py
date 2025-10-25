@@ -29,6 +29,10 @@ ExecutorResponse = tllm_executor.Response
 ExecutorSamplingConfig = tllm_executor.SamplingConfig
 FinishReason = tllm_executor.FinishReason
 
+def resolve_priority(source) -> float | None:
+    priority = getattr(source, "priority", None)
+    return float(priority) if priority is not None else None
+
 REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION:
     LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
@@ -699,7 +703,7 @@ def executor_request_to_llm_request(
         mrope_rotary_cos_sin = executor_request.mrope_config.mrope_rotary_cos_sin
         mrope_position_deltas = executor_request.mrope_config.mrope_position_deltas
 
-    llm_request = LlmRequest(
+    llm_request_kwargs = dict(
         request_id=req_id,
         max_new_tokens=executor_request.max_tokens,
         input_tokens=input_tokens,
@@ -758,13 +762,18 @@ def executor_request_to_llm_request(
         return_encoder_output=False,
         client_id=executor_request.client_id
         if executor_request.client_id is not None else req_id,
-        priority=0.5,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt_id=executor_request.cache_salt_id,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
+
+    priority = resolve_priority(executor_request)
+    if priority is not None:
+        llm_request_kwargs["priority"] = priority
+
+    llm_request = LlmRequest(**llm_request_kwargs)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
