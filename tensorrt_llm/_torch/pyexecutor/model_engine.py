@@ -1326,6 +1326,17 @@ class PyTorchModelEngine(ModelEngine):
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
 
+        request_id_to_org: dict[int, Optional[int]] = {}
+        organization_id = lambda req: getattr(req, "organization_id", None)
+        for req in scheduled_requests.context_requests:
+            request_id_to_org[req.py_request_id] = organization_id(req)
+        for req in extend_requests:
+            request_id_to_org[req.py_request_id] = organization_id(req)
+        for req in generation_requests:
+            request_id_to_org[req.py_request_id] = organization_id(req)
+        for req in first_draft_requests:
+            request_id_to_org[req.py_request_id] = organization_id(req)
+
         spec_config = self.spec_config if self.enable_spec_decode else None
         if not self._disable_overlap_scheduler and spec_config is not None:
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
@@ -1735,6 +1746,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
+            spec_metadata.organization_ids = [
+                organization_id(req) for req in scheduled_requests.context_requests
+            ]
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -1782,6 +1796,10 @@ class PyTorchModelEngine(ModelEngine):
         draft_lens = []
         request_ids = []
         multimodal_params_list = []
+        request_id_to_org = {
+            req.py_request_id: getattr(req, "py_organization_id", None)
+            for req in scheduled_requests.context_requests
+        }
 
         for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
@@ -1890,6 +1908,9 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
             spec_metadata.seq_lens = sequence_lengths
+            spec_metadata.organization_ids = [
+                request_id_to_org.get(rid) for rid in request_ids
+            ]
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

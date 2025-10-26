@@ -1,5 +1,6 @@
 from .auto_heuristic import suggest_spec_config
 from .eagle3 import Eagle3SpecMetadata
+from .hidden_state_capture import HiddenStateObserver, HiddenStateRecord
 from .interface import SpecMetadata
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
@@ -29,4 +30,6 @@ __all__ = [
     "update_spec_config_from_model_config",
     "suggest_spec_config",
     "SpecTreeManager",
+    "HiddenStateRecord",
+    "HiddenStateObserver",
 ]

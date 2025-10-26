@@ -16,6 +16,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
                                   add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
+from .hidden_state_capture import HiddenStateObserver, HiddenStateRecord
 from .interface import SpecMetadata
 
 if TYPE_CHECKING:
@@ -118,6 +119,8 @@ class MTPSpecMetadata(SpecMetadata):
     # CUDA graph, we use this tensor to store the number of input tokens for the
     # subsequence draft forward.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
+    # Optional organization identifiers per active slot.
+    organization_ids: Optional[List[Optional[object]]] = None
 
     def __post_init__(self) -> None:
         if self.mtp_hidden_states_manager is not None:
@@ -337,6 +340,13 @@ class MTPWorker(nn.Module):
         self.model_config = model_config
         self.is_thop = False
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
+        self._hidden_state_observer: Optional[HiddenStateObserver] = None
+        self._hidden_state_iteration: int = 0
+
+    def register_hidden_state_observer(
+            self, observer: Optional[HiddenStateObserver]) -> None:
+        """Register a callback invoked with hidden state capture records."""
+        self._hidden_state_observer = observer
 
     def forward(
         self,
@@ -458,6 +468,13 @@ class MTPWorker(nn.Module):
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
+        self._emit_hidden_state_events(
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            spec_metadata=spec_metadata,
+            attn_metadata=attn_metadata,
+        )
 
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,
@@ -886,6 +903,106 @@ class MTPWorker(nn.Module):
                     dim=-1).sum(1)
 
         return accepted_tokens, num_accepted_tokens
+
+    def _emit_hidden_state_events(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        spec_metadata: MTPSpecMetadata,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        observer = self._hidden_state_observer
+        if observer is None or spec_metadata.request_ids is None:
+            return
+
+        batch_size = attn_metadata.num_seqs
+        if batch_size == 0:
+            return
+        request_ids = spec_metadata.request_ids
+        if len(request_ids) < batch_size:
+            # Metadata mismatch; skip emitting to avoid inconsistent records.
+            return
+
+        num_contexts = attn_metadata.num_contexts
+        num_ctx_tokens = attn_metadata.num_ctx_tokens
+        num_gens = batch_size - num_contexts
+        hidden_size = hidden_states.shape[-1]
+        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        organization_ids = getattr(spec_metadata, "organization_ids", None)
+
+        def _to_py_int(value):
+            if isinstance(value, torch.Tensor):
+                return int(value.item())
+            return int(value)
+
+        with torch.no_grad():
+            iteration = self._hidden_state_iteration
+            last_tokens_idx = torch.cumsum(attn_metadata.seq_lens_cuda,
+                                           dim=0,
+                                           dtype=torch.long) - 1
+
+            if num_contexts > 0:
+                context_hidden = hidden_states[last_tokens_idx[:num_contexts]]
+                context_tokens = accepted_tokens[:num_contexts, 0]
+                for ctx_idx in range(num_contexts):
+                    num_accepted = int(num_accepted_tokens[ctx_idx].item())
+                    token_tensor = context_tokens[ctx_idx].detach().unsqueeze(
+                        0).to(device='cpu')
+                    hidden_tensor = context_hidden[ctx_idx].detach().unsqueeze(
+                        0).to(device='cpu')
+                    org_id = None
+                    if organization_ids is not None and len(
+                            organization_ids) > ctx_idx:
+                        org_value = organization_ids[ctx_idx]
+                        if isinstance(org_value, torch.Tensor):
+                            org_value = org_value.item()
+                        org_id = org_value
+                    record = HiddenStateRecord(request_id=_to_py_int(
+                        request_ids[ctx_idx]),
+                                               phase="context",
+                                               tokens=token_tensor,
+                                               hidden_states=hidden_tensor,
+                                               num_accepted=num_accepted,
+                                               organization_id=org_id,
+                                               iteration=iteration)
+                    observer(record)
+
+            if num_gens > 0:
+                hidden_states_gen = hidden_states[num_ctx_tokens:].contiguous(
+                ).reshape(num_gens, mtp_num_modules + 1, hidden_size)
+                accepted_tokens_gen = accepted_tokens[num_contexts:, :]
+                num_accepted_gen = num_accepted_tokens[num_contexts:]
+
+                for gen_idx in range(num_gens):
+                    accepted_count = int(num_accepted_gen[gen_idx].item())
+                    if accepted_count <= 0:
+                        continue
+
+                    tokens_tensor = accepted_tokens_gen[gen_idx, :accepted_count].detach().to(  # noqa: E501
+                        device='cpu')
+                    states_tensor = hidden_states_gen[gen_idx, :accepted_count,
+                                                      :].detach().to(
+                                                          device='cpu')
+                    org_id = None
+                    if organization_ids is not None and len(
+                            organization_ids) > num_contexts + gen_idx:
+                        org_value = organization_ids[num_contexts + gen_idx]
+                        if isinstance(org_value, torch.Tensor):
+                            org_value = org_value.item()
+                        org_id = org_value
+                    record = HiddenStateRecord(request_id=_to_py_int(
+                        request_ids[num_contexts + gen_idx]),
+                                               phase="generation",
+                                               tokens=tokens_tensor,
+                                               hidden_states=states_tensor,
+                                               num_accepted=accepted_count,
+                                               organization_id=org_id,
+                                               iteration=iteration)
+                    observer(record)
+
+        self._hidden_state_iteration += 1
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
                              attn_metadata: AttentionMetadata):

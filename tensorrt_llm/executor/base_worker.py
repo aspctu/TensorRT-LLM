@@ -502,6 +502,9 @@ class BaseWorker(GenerationExecutor):
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
+            if getattr(request, "organization_id", None) is not None:
+                executor_request.py_organization_id = request.organization_id
+
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update

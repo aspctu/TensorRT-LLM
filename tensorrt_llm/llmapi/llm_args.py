@@ -798,7 +798,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
     relaxed_delta: float = 0.
     use_mtp_vanilla: bool = False
     mtp_eagle_one_model: bool = True
-
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
     num_nextn_predict_layers_from_model_config: int = 1

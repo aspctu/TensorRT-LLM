@@ -105,7 +105,9 @@ class ModelDrafter(Drafter):
             is_draft=True,
             # NB: self.sampler is shared with PyExecutor
             return_generation_logits=self.sampler.should_provide_draft_probs(
-                request))
+                request),
+            organization_id=getattr(request, "py_organization_id", None),
+        )
 
     def _initialize_draft_tokens(self, request: LlmRequest) -> Tuple[int, int]:
         """Initialize draft token tracking for a request."""

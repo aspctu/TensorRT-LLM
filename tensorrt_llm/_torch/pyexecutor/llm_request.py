@@ -445,6 +445,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
+            organization_id: Optional[int] = None,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -452,6 +453,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        self.organization_id = kwargs.pop("organization_id", None)
         if llm_request is not None:
             super().__init__(llm_request)
         else:
@@ -765,6 +767,7 @@ def executor_request_to_llm_request(
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
+        organization_id=getattr(executor_request, "organization_id", None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config)
     if child_req_ids:
         for child_id in child_req_ids:
