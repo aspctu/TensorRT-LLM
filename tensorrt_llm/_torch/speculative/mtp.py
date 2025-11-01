@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -22,6 +21,7 @@ from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
                                   add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
+from .hidden_state_streamer import HiddenStateDump, HiddenStateStreamer
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -224,11 +224,17 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    def __init__(self, args: TorchSampler.Args, *, nextn: int):
+    def __init__(
+        self,
+        args: TorchSampler.Args,
+        *,
+        nextn: int,
+        hidden_state_streamer: Optional[HiddenStateStreamer] = None
+    ):
         self.mapping = None
         self.draft_len = nextn
         self._dump_counters: dict[int, int] = defaultdict(int)
-        self._dump_dir_cache: Optional[str] = None
+        self._hidden_state_streamer = hidden_state_streamer
         super().__init__(args)
 
     @dataclass(frozen=True, kw_only=True)
@@ -292,18 +298,16 @@ class MTPSampler(TorchSampler):
         dump_hidden_states = state.host.hidden_state_dumps
         dump_tokens = state.host.mtp_tokens
 
-        if dump_hidden_states is None or dump_tokens is None:
+        streamer = self._hidden_state_streamer
+        if (
+            dump_hidden_states is None
+            or dump_tokens is None
+            or streamer is None
+        ):
             return
 
         if local_mpi_rank() != 0:
             return
-
-        # TODO: Abu: Wire this up via llmargs
-        dump_dir = os.path.join(os.getcwd(), "mtp_hidden_state_dumps")
-        if self._dump_dir_cache is None:
-            self._dump_dir_cache = dump_dir
-
-        os.makedirs(dump_dir, exist_ok=True)
 
         requests = state.scheduled_requests.all_requests()
         next_input_tokens_device = state.device.new_tokens
@@ -322,21 +326,16 @@ class MTPSampler(TorchSampler):
             # NOTE: .item() forces a sync 
             next_token = accepted_tokens[-1].item() if accepted_len > 0 else -100
 
-            payload = {
-                "request_id": request_id,
-                "step": step_idx,
-                "hidden_states": dump_hidden_states[idx].clone(),
-                "mtp_tokens": dump_tokens[idx].clone(),
-                "accepted_tokens": accepted_tokens,
-                "next_input_tokens": next_input_tokens,
-                "next_token": next_token,
-            }
-
-            file_path = os.path.join(
-                dump_dir,
-                f"request_{request_id}_step_{step_idx}.pt"
+            dump = HiddenStateDump(
+                request_id=request_id,
+                step=step_idx,
+                hidden_states=dump_hidden_states[idx].clone(),
+                mtp_tokens=dump_tokens[idx].clone(),
+                accepted_tokens=accepted_tokens,
+                next_input_tokens=next_input_tokens,
+                next_token=next_token,
             )
-            torch.save(payload, file_path)
+            streamer.send(dump)
 
     def sample_async(
             self, scheduled_requests: ScheduledRequests,

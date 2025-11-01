@@ -10,6 +10,7 @@ from ..speculative.interface import SpecMetadata
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
+from .hidden_state_streamer import build_hidden_state_streamer
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -163,8 +164,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
 def get_spec_decoder(sampler_args: TorchSampler.Args,
                      spec_config: "DecodingBaseConfig"):
     if spec_config.spec_dec_mode.is_mtp_one_model():
+        streamer = build_hidden_state_streamer(spec_config)
         return MTPSampler(sampler_args,
-                          nextn=spec_config.num_nextn_predict_layers)
+                          nextn=spec_config.num_nextn_predict_layers,
+                          hidden_state_streamer=streamer)
     if spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process

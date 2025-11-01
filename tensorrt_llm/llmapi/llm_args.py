@@ -800,6 +800,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     mtp_eagle_one_model: bool = True
     dump_hidden_states: bool = False
     hidden_state_dump_dir: Optional[str] = None
+    hidden_state_stream_target: Optional[str] = None
+    hidden_state_stream_method: Optional[str] = None
+    hidden_state_stream_metadata: Optional[Dict[str, str]] = None
+    hidden_state_stream_timeout_seconds: Optional[float] = None
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
