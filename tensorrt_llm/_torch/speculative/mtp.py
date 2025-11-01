@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import os
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -5,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -26,12 +31,15 @@ if TYPE_CHECKING:
 class SampleStateTensorsMTP(SampleStateTensors):
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
+    hidden_state_dumps: Optional[torch.Tensor] = None
+    mtp_tokens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
 class SampleStateMTP(SampleState):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
+    dump_dir: Optional[str] = None
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
@@ -219,6 +227,8 @@ class MTPSampler(TorchSampler):
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
+        self._dump_counters: dict[int, int] = defaultdict(int)
+        self._dump_dir_cache: Optional[str] = None
         super().__init__(args)
 
     @dataclass(frozen=True, kw_only=True)
@@ -279,6 +289,55 @@ class MTPSampler(TorchSampler):
             req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list)
 
+        dump_hidden_states = state.host.hidden_state_dumps
+        dump_tokens = state.host.mtp_tokens
+
+        if dump_hidden_states is None or dump_tokens is None:
+            return
+
+        if local_mpi_rank() != 0:
+            return
+
+        # TODO: Abu: Wire this up via llmargs
+        dump_dir = os.path.join(os.getcwd(), "mtp_hidden_state_dumps")
+        if self._dump_dir_cache is None:
+            self._dump_dir_cache = dump_dir
+
+        os.makedirs(dump_dir, exist_ok=True)
+
+        requests = state.scheduled_requests.all_requests()
+        next_input_tokens_device = state.device.new_tokens
+        for idx, req in enumerate(requests):
+            request_id = req.request_id
+            self._dump_counters[request_id] += 1
+            step_idx = self._dump_counters[request_id]
+
+            accepted_tokens_tensor = state.host.new_tokens[:, req.py_seq_slot, 0]
+            accepted_len = new_tokens_lens_list[req.py_seq_slot]
+            accepted_tokens = accepted_tokens_tensor[:accepted_len].clone()
+            next_input_tokens = next_input_tokens_device[:, req.py_seq_slot,
+                                                         0].to('cpu',
+                                                                non_blocking=True).clone()
+
+            # NOTE: .item() forces a sync 
+            next_token = accepted_tokens[-1].item() if accepted_len > 0 else -100
+
+            payload = {
+                "request_id": request_id,
+                "step": step_idx,
+                "hidden_states": dump_hidden_states[idx].clone(),
+                "mtp_tokens": dump_tokens[idx].clone(),
+                "accepted_tokens": accepted_tokens,
+                "next_input_tokens": next_input_tokens,
+                "next_token": next_token,
+            }
+
+            file_path = os.path.join(
+                dump_dir,
+                f"request_{request_id}_step_{step_idx}.pt"
+            )
+            torch.save(payload, file_path)
+
     def sample_async(
             self, scheduled_requests: ScheduledRequests,
             outputs: dict[str, torch.Tensor],
@@ -289,13 +348,14 @@ class MTPSampler(TorchSampler):
         # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
 
         requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.py_seq_slot for r in requests])
+        slots = torch.as_tensor([r.py_seq_slot for r in requests], dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
 
         o_new_tokens = outputs['new_tokens'][:len(requests)]
         o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
         o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
         o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
+        dump_payload = outputs.get('hidden_state_dumps')
 
         new_tokens = self.store.new_tokens
         next_new_tokens = self.store.next_new_tokens
@@ -307,15 +367,31 @@ class MTPSampler(TorchSampler):
         new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
         next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
 
+        device_hidden_state_dump = None
+        device_mtp_tokens = None
+        host_hidden_state_dump = None
+        host_mtp_tokens = None
+
+        if dump_payload is not None:
+            device_hidden_state_dump = dump_payload['hidden_states'][:len(requests)]
+            device_mtp_tokens = dump_payload['tokens'][:len(requests)]
+            host_hidden_state_dump = device_hidden_state_dump.to(
+                'cpu', non_blocking=True)
+            host_mtp_tokens = device_mtp_tokens.to('cpu', non_blocking=True)
+
         device = SampleStateTensorsMTP(
             new_tokens=next_new_tokens,
             new_tokens_lens=new_tokens_lens,
             next_draft_tokens=next_draft_tokens,
+            hidden_state_dumps=device_hidden_state_dump,
+            mtp_tokens=device_mtp_tokens,
         )
         host = SampleStateTensorsMTP(
             new_tokens=new_tokens.to('cpu', non_blocking=True),
             new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
             next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
+            hidden_state_dumps=host_hidden_state_dump,
+            mtp_tokens=host_mtp_tokens,
         )
         sampler_event = torch.cuda.Event()
         sampler_event.record()
@@ -529,13 +605,17 @@ class MTPWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
-        return {
+        result = {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens
         }
+        dump_payload = self._build_hidden_state_dump(spec_metadata, batch_size)
+        if dump_payload is not None:
+            result['hidden_state_dumps'] = dump_payload
+        return result
 
     def skip_forward(
         self,
@@ -1145,6 +1225,22 @@ class MTPWorker(nn.Module):
 
         return draft_tokens
 
+    def _build_hidden_state_dump(self, spec_metadata: MTPSpecMetadata,
+                                 batch_size: int):
+        if not getattr(self.spec_config, "dump_hidden_states", False):
+            return None
+        manager = spec_metadata.mtp_hidden_states_manager
+        if manager is None:
+            return None
+        slot_ids = spec_metadata.slot_ids[:batch_size].long()
+        hidden_states = manager.mtp_past_hidden_states_pool.index_select(
+            0, slot_ids)
+        tokens = manager.mtp_past_tokens_pool.index_select(0, slot_ids)
+        return {
+            "hidden_states": hidden_states,
+            "tokens": tokens,
+        }
+
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
         self.guided_decoder = guided_decoder
@@ -1159,6 +1255,69 @@ class MTPEagleWorker(MTPWorker):
         super().__init__(spec_config, model_config)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
+
+    def _build_eagle_dump_payload(
+        self,
+        hidden_states: torch.Tensor,           # [sum_len, H] packed target hidden states (contexts first, then gens)
+        accepted_tokens: torch.Tensor,         # [B, nextn+1] per-request accepted tokens for this step (incl. golden)
+        num_accepted_tokens: torch.Tensor,     # [B] number of accepted tokens per request this step
+        attn_metadata: AttentionMetadata,
+        spec_metadata: MTPSpecMetadata,
+    ):
+        # ------- basic sizes -------
+        B = attn_metadata.num_seqs                     # total requests in batch
+        C = attn_metadata.num_contexts                 # count of context requests
+        G = B - C                                      # count of generation requests
+        nextn = self.spec_config.num_nextn_predict_layers
+        H = hidden_states.size(-1)                     # hidden size
+        num_ctx_tokens = attn_metadata.num_ctx_tokens  # total packed tokens that belong to contexts (prefix of hidden_states)
+        device = hidden_states.device
+
+        # Outputs (fixed-shape, zero-padded):
+        # dump_hs: [B, nextn, H]   dump_tok: [B, nextn]
+        dump_hs  = hidden_states.new_zeros((B, nextn, H))
+        dump_tok = accepted_tokens.new_zeros((B, nextn))
+
+        # ------- CONTEXT rows -------
+        # For contexts, we take the last hidden state of each context sequence (one token),
+        # and place it in column 0. Tokens mirror the first accepted token in that row.
+        if C > 0:
+            # last_idx: [C] indices of last tokens per context row in the packed hidden_states
+            last_idx = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            # ctx_hs: [C, H] last hidden state per context row
+            ctx_hs = hidden_states.index_select(0, last_idx[:C])
+            dump_hs[:C, 0, :].copy_(ctx_hs)
+            if accepted_tokens.size(1) > 0:
+                dump_tok[:C, 0].copy_(accepted_tokens[:C, 0])
+
+        # ------- GENERATION rows -------
+        # For generations, we dump the first Ti hidden states/tokens for each row,
+        # where Ti = clamp(num_accepted_tokens, 0..nextn).
+        if G > 0:
+            # Slice the packed hidden_states to the generation portion and reshape:
+            # gen_hs: [G, nextn+1, H] → take first nextn along draft window → [G, nextn, H]
+            gen_hs = hidden_states.narrow(0, num_ctx_tokens, (nextn + 1) * G) \
+                                .view(G, nextn + 1, H)[:, :nextn, :]
+            # gen_tok: [G, nextn] tokens aligned with gen_hs (drop the +1 column to keep shape stable)
+            gen_tok = accepted_tokens.narrow(0, C, G)[:, :nextn]
+            # Ti: [G] number of accepted tokens per gen row, clamped to [0, nextn]
+            Ti      = torch.clamp(num_accepted_tokens.narrow(0, C, G), 0, nextn)
+
+            # mask: [G, nextn] where mask[g, j] = (j < Ti[g]); True cells are valid, False are padding
+            cols = torch.arange(nextn, device=device, dtype=Ti.dtype)
+            mask = (cols.unsqueeze(0) < Ti.unsqueeze(1))
+
+            # Write into dump (keep invalid/padded positions at zero)
+            # hidden states
+            dump_hs[C:C+G, :, :].copy_(torch.where(mask.unsqueeze(-1), gen_hs, 0))
+            # tokens (ints)
+            dump_tok[C:C+G, :].copy_(torch.where(mask, gen_tok, torch.zeros_like(gen_tok)))
+
+        # Returned tensors remain on CUDA; sampler will move them to CPU (non-blocking) before saving.
+        return {
+            "hidden_states": dump_hs,   # [B, nextn, H] (cuda)
+            "tokens":        dump_tok,  # [B, nextn]    (cuda)
+        }
 
     @torch.compile(options={"max-autotune": True})
     def update_draft_tokens(self, next_draft_tokens, new_draft_token,
@@ -1191,6 +1350,16 @@ class MTPEagleWorker(MTPWorker):
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
+
+        dump_payload = None
+        if getattr(self.spec_config, "dump_hidden_states", False):
+            dump_payload = self._build_eagle_dump_payload(
+                hidden_states=hidden_states,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+            )
 
         # Save the old attn_metadata and spec_metadata
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
@@ -1351,13 +1520,16 @@ class MTPEagleWorker(MTPWorker):
             next_draft_tokens, accepted_tokens, spec_metadata, batch_size,
             num_accepted_tokens)
 
-        return {
+        result = {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens
         }
+        if dump_payload is not None:
+            result['hidden_state_dumps'] = dump_payload
+        return result
 
     @torch.compile(options={"max-autotune": True})
     def prepare_drafter_inputs(

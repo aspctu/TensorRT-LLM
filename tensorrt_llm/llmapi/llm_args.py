@@ -798,6 +798,8 @@ class MTPDecodingConfig(DecodingBaseConfig):
     relaxed_delta: float = 0.
     use_mtp_vanilla: bool = False
     mtp_eagle_one_model: bool = True
+    dump_hidden_states: bool = False
+    hidden_state_dump_dir: Optional[str] = None
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -823,6 +825,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
         out.max_draft_len = out.num_nextn_predict_layers
         out.max_total_draft_tokens = out.num_nextn_predict_layers  # Current MTP only support linear tree
         return out
+
+    def model_post_init(self, __context):
+        super().model_post_init(__context)
 
     decoding_type: ClassVar[str] = "MTP"
 
