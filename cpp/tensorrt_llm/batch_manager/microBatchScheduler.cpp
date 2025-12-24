@@ -19,6 +19,8 @@
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
+#include <unordered_set>
+
 namespace tensorrt_llm::batch_manager
 {
 
@@ -26,11 +28,16 @@ using SizeType32 = MicroBatchScheduler::SizeType32;
 
 MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig,
     std::optional<SizeType32> maxContextLength, LlmRequestState noScheduleUntilState,
-    LlmRequestState noScheduleAfterState)
+    LlmRequestState noScheduleAfterState, bool decodeTokenBudgetEnabled, float decodeTokenBudgetScaleTokens,
+    float decodeTokenBudgetMinRate, float decodeTokenBudgetMaxBalance)
     : mMaxContextLength(maxContextLength)
     , mCtxChunkConfig(ctxChunkConfig)
     , mNoScheduleUntilState(noScheduleUntilState)
     , mNoScheduleAfterState(noScheduleAfterState)
+    , mDecodeTokenBudgetEnabled(decodeTokenBudgetEnabled)
+    , mDecodeTokenBudgetScaleTokens(decodeTokenBudgetScaleTokens)
+    , mDecodeTokenBudgetMinRate(decodeTokenBudgetMinRate)
+    , mDecodeTokenBudgetMaxBalance(decodeTokenBudgetMaxBalance)
 {
 }
 
@@ -175,14 +182,98 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(microBatcherScheduleRequests);
 
+    /* Decode token-budget scheduling
+    * We observe that users who send us requests that generate many tokens (long output requests) 
+    * cause significant performance degradation. By default, we run GUARANTEED_NO_EVICT scheduler which means that a 
+    * request that generates many tokens can take up a batch slot for a while. Other requests, like shorter requests,  
+    * spend time waiting in the queue for long-output to finish. The following ONLY applies when all batch slots are 
+    * occupied.
+    *
+    * We solve this with a "decode-token budget". At each time step, every generation request earns credit. 
+    *   credit_per_timestep = (max(min_credit, 1 / (1 + total generated tokens / generated token scale)))
+    * The more tokens a request has already generated, the less "credit" that request is given. 
+    * 
+    * A request is eligible to be scheduled for decode when its credit balance reaches >= 1.0. 
+    *   credit = sum(credit_per_timestep) over timesteps
+    * 
+    * Each scheduling iteration consumes 1 credit. If the scheduler has skipped many iterations on a given request, we cap how much
+    * credit it can accmulate so that it doesn't dominate the next set of iterations. 
+    *
+    * Resulting behavior:
+    *   - Under light load, behavior is unchanged (the credit mechanism is off).
+    *   - Under overload, short / newly-started generations tend to be scheduled every step, while long-running decode
+    *     requests skip some steps so they cannot continuously hog batch slots.
+    *   - The long-running requests still make forward progress and keep their KV cache resident; they are just
+    *     scheduled less frequently.
+    * 
+    * One risk is that if a long output request is not scheduled, it's KV cache may be evicted.
+    */
+
     RequestVector contextRequests, generationRequests;
     SizeType32 batchNumTokens{0};
     SizeType32 scheduledReqSize{0};
     SizeType32 scheduledBeamWidth{0}; // 0 means no request is scheduled
 
+    bool applyDecodeTokenBudget = false;
+    std::unordered_set<LlmRequest::RequestIdType> seenDecodeIds;
+    // We only apply the decode token budget when there are requests pending and the batch is full.
+    if (mDecodeTokenBudgetEnabled && maxBatchSizeRuntime > 0
+        && activeRequests.size() > static_cast<std::size_t>(maxBatchSizeRuntime))
+    {
+        applyDecodeTokenBudget = true;
+        if (mDecodeTokenBudgetScaleTokens <= 0.0f)
+        {
+            applyDecodeTokenBudget = false;
+        }
+        if (mDecodeTokenBudgetMinRate <= 0.0f)
+        {
+            applyDecodeTokenBudget = false;
+        }
+        if (mDecodeTokenBudgetMaxBalance < 1.0f)
+        {
+            applyDecodeTokenBudget = false;
+        }
+    }
+
+    if (applyDecodeTokenBudget)
+    {
+        for (auto const& llmReq : activeRequests)
+        {
+            if (!llmReq->isGenerationInProgressState())
+            {
+                continue;
+            }
+            auto const reqId = llmReq->mRequestId;
+            seenDecodeIds.insert(reqId);
+            // If the request is already in-flight on another micro-batch, we don't want to "re-credit" it here.
+            if (inflightReqIds.find(reqId) != inflightReqIds.end())
+            {
+                continue;
+            }
+            auto const generated = static_cast<float>(llmReq->getMaxNumGeneratedTokens());
+            auto rate = 1.0f / (1.0f + (generated / mDecodeTokenBudgetScaleTokens));
+            rate = std::max(rate, mDecodeTokenBudgetMinRate);
+            auto& credit = mDecodeTokenBudgetCredits[reqId];
+            credit = std::min(credit + rate, mDecodeTokenBudgetMaxBalance);
+        }
+
+        for (auto it = mDecodeTokenBudgetCredits.begin(); it != mDecodeTokenBudgetCredits.end();)
+        {
+            if (seenDecodeIds.count(it->first) == 0)
+            {
+                it = mDecodeTokenBudgetCredits.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
     RequestVector contextsToBeChunked;
     SizeType32 numChunkedTokens{0};
     bool allContextRequestsFit{true};
+    std::shared_ptr<LlmRequest> firstGenCandidate;
 
     // 1. Select the generation phase requests that meet the criteria of total token size.
     //    If there is any remaining space, include the context requests and divide them into chunks.
@@ -273,6 +364,23 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                     llmReq->mRequestId, reqBeamWidth, scheduledBeamWidth);
                 continue;
             }
+            if (!firstGenCandidate)
+            {
+                firstGenCandidate = llmReq;
+            }
+            if (applyDecodeTokenBudget)
+            {
+                auto const reqId = llmReq->mRequestId;
+                auto it = mDecodeTokenBudgetCredits.find(reqId);
+                if (it != mDecodeTokenBudgetCredits.end() && it->second < 1.0f)
+                {
+                    continue;
+                }
+                if (it != mDecodeTokenBudgetCredits.end())
+                {
+                    it->second -= 1.0f;
+                }
+            }
             TLLM_LOG_DEBUG("generation request scheduled: ID %u with beam width %d", llmReq->mRequestId, reqBeamWidth);
             generationRequests.emplace_back(llmReq);
             batchNumTokens += reqNumTokens;
@@ -281,6 +389,16 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         if (++scheduledReqSize >= maxBatchSizeRuntime)
         {
             break;
+        }
+    }
+
+    if (generationRequests.empty() && firstGenCandidate && contextsToBeChunked.empty() && contextRequests.empty())
+    {
+        auto const reqBeamWidth = firstGenCandidate->getBeamWidthByIter();
+        auto const reqNumTokens = reqBeamWidth + firstGenCandidate->getNumDraftTokens();
+        if (!maxNumTokensRuntime || reqNumTokens <= maxNumTokensRuntime.value())
+        {
+            generationRequests.emplace_back(firstGenCandidate);
         }
     }
 

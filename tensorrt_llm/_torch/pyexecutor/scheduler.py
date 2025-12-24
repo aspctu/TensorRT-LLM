@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, DecodeTokenBudgetConfig
 
 from .llm_request import LlmRequest, LlmRequestState
 
@@ -175,6 +175,7 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
+        decode_token_budget_config: Optional[DecodeTokenBudgetConfig] = None,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
@@ -185,8 +186,24 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
             ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1])
 
+        decode_token_budget_enabled = False
+        decode_token_budget_scale_tokens = 256.0
+        decode_token_budget_min_rate = 0.1
+        decode_token_budget_max_balance = 2.0
+        if decode_token_budget_config is not None:
+            decode_token_budget_enabled = bool(decode_token_budget_config.enabled)
+            decode_token_budget_scale_tokens = float(decode_token_budget_config.scale_tokens)
+            decode_token_budget_min_rate = float(decode_token_budget_config.min_rate)
+            decode_token_budget_max_balance = float(decode_token_budget_config.max_balance)
+
         self.impl = tb_internal.algorithms.MicroBatchScheduler(
-            ctx_chunk_config_cpp, max_num_tokens)
+            ctx_chunk_config_cpp,
+            max_num_tokens,
+            decode_token_budget_enabled=decode_token_budget_enabled,
+            decode_token_budget_scale_tokens=decode_token_budget_scale_tokens,
+            decode_token_budget_min_rate=decode_token_budget_min_rate,
+            decode_token_budget_max_balance=decode_token_budget_max_balance,
+        )
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]

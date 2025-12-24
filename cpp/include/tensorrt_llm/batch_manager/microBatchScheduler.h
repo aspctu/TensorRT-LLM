@@ -21,6 +21,8 @@
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include <unordered_map>
+
 namespace tensorrt_llm::batch_manager
 {
 
@@ -53,7 +55,9 @@ public:
     explicit MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
         std::optional<SizeType32> maxContextLength = std::nullopt,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE,
+        bool decodeTokenBudgetEnabled = false, float decodeTokenBudgetScaleTokens = 256.0f,
+        float decodeTokenBudgetMinRate = 0.1f, float decodeTokenBudgetMaxBalance = 2.0f);
 
     std::tuple<RequestVector, RequestVector> operator()(RequestVector& activeRequests, ReqIdsSet const& inflightReqIds,
         SizeType32 maxBatchSizeRuntime, std::optional<SizeType32> maxNumTokensRuntime) const;
@@ -83,6 +87,13 @@ private:
     /// The state until/after which the scheduler should not schedule requests
     LlmRequestState mNoScheduleUntilState;
     LlmRequestState mNoScheduleAfterState;
+
+    bool mDecodeTokenBudgetEnabled{false};
+    float mDecodeTokenBudgetScaleTokens{256.0f};
+    float mDecodeTokenBudgetMinRate{0.1f};
+    float mDecodeTokenBudgetMaxBalance{2.0f};
+
+    mutable std::unordered_map<LlmRequest::RequestIdType, float> mDecodeTokenBudgetCredits{};
 };
 
 } // namespace tensorrt_llm::batch_manager
