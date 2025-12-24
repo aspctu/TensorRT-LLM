@@ -1433,6 +1433,44 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             dynamic_batch_moving_average_window)
 
 
+class DecodeTokenBudgetConfig(StrictBaseModel):
+    """
+    Decode-time "token budget" scheduling config
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable decode token-budget scheduling in the micro-batch scheduler."
+    )
+    scale_tokens: int = Field(
+        default=256,
+        description=
+        "Controls how quickly credit decays as a request generates more tokens. Larger is gentler.",
+    )
+    min_rate: float = Field(
+        default=0.1,
+        description="Lower bound on credit for long-running decode requests. This prevents starvation for a large decode tokens request.",
+    )
+    max_balance: float = Field(
+        default=2.0,
+        description="Maximum accumulated credits for a request. This prevents overzealous scheduling after many skipped iteartions.",
+    )
+
+    @field_validator("scale_tokens")
+    @classmethod
+    def validate_scale_tokens_positive(cls, v: int):
+        if v <= 0:
+            raise ValueError(f"scale_tokens must be > 0, got {v}")
+        return v
+
+    @field_validator("min_rate", "max_balance")
+    @classmethod
+    def validate_positive_floats(cls, v: float):
+        if v <= 0:
+            raise ValueError(f"value must be > 0, got {v}")
+        return v
+
+
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
 class SchedulerConfig(StrictBaseModel, PybindMirror):
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
@@ -2007,6 +2045,12 @@ class BaseLlmArgs(StrictBaseModel):
     scheduler_config: SchedulerConfig = Field(default_factory=SchedulerConfig,
                                               description="Scheduler config.",
                                               status="prototype")
+
+    decode_token_budget_config: Optional[DecodeTokenBudgetConfig] = Field(
+        default=None,
+        description=
+        "Decode token-budget scheduling configuration (PyTorch backend only). If unset, the micro-batch scheduler uses the default behavior.",
+        status="prototype")
 
     cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
         default=None,

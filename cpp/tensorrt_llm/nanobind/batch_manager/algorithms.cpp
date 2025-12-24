@@ -61,10 +61,12 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
 
     nb::class_<MicroBatchScheduler>(m, MicroBatchScheduler::name)
         .def(nb::init<std::optional<batch_scheduler::ContextChunkingConfig>, std::optional<SizeType32>, LlmRequestState,
-                 LlmRequestState>(),
+                 LlmRequestState, bool, float, float, float>(),
             nb::arg("ctx_chunk_config") = std::nullopt, nb::arg("max_context_length") = std::nullopt,
             nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
-            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_TO_COMPLETE)
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_TO_COMPLETE,
+            nb::arg("decode_token_budget_enabled") = false, nb::arg("decode_token_budget_scale_tokens") = 256.0f,
+            nb::arg("decode_token_budget_min_rate") = 0.1f, nb::arg("decode_token_budget_max_balance") = 2.0f)
         .def("__call__", &MicroBatchScheduler::operator(), nb::arg("active_requests"), nb::arg("inflight_req_ids"),
             nb::arg("max_batch_size_runtime"), nb::arg("max_num_tokens_runtime"))
         .def("name", [](MicroBatchScheduler const&) { return MicroBatchScheduler::name; });

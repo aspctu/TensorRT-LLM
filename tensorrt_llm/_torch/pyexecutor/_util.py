@@ -812,8 +812,12 @@ def create_py_executor_instance(
         peft_cache_manager.impl if peft_cache_manager is not None else None,
         scheduler_config.capacity_scheduler_policy,
         two_step_lookahead=mapping.has_pp())
-    mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                           ctx_chunk_config)
+    mb_scheduler = BindMicroBatchScheduler(
+        max_batch_size,
+        max_num_tokens,
+        ctx_chunk_config,
+        decode_token_budget_config=llm_args.decode_token_budget_config,
+    )
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config
