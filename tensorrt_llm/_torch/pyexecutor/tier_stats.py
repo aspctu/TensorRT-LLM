@@ -1,3 +1,13 @@
+"""Rolling per-tier runtime stats for the PyTorch executor.
+
+The collector intentionally works on request-like objects instead of a shared
+protocol because the worker path uses a mix of Python request wrappers and
+nanobind-backed `LlmRequest` objects. The expected contract is limited to the
+attributes accessed below: request/tier metadata, timing fields populated by
+the executor (`py_*_time`), request ids, generated-token counters, and the
+state/chunk helpers needed by `scheduled_token_cost`.
+"""
+
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Iterable, Optional

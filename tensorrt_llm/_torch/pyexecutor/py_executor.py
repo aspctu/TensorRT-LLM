@@ -129,6 +129,13 @@ class BatchStatePP(BatchState):
     microbatch_id: int = -1
 
 
+@dataclasses.dataclass
+class IterationStatsBundle:
+    iteration_stats: IterationStats
+    req_stats: Optional[List[RequestStats]] = None
+    py_stats_extra: Optional[Dict[str, object]] = None
+
+
 class AsyncTransferManager:
     """
     Handle asynchronous transfer of KV cache after a request has completed.
@@ -763,7 +770,7 @@ class PyExecutor:
         if self.enable_iter_perf_stats == False:
             return []
 
-        latest_stats = (IterationStats(), None)
+        latest_stats = []
         with self.stats_lock:
             latest_stats = self.stats
             self.stats = []
@@ -1144,7 +1151,12 @@ class PyExecutor:
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
-            self.stats.append((stats, req_stats, py_stats_extra))
+            self.stats.append(
+                IterationStatsBundle(
+                    iteration_stats=stats,
+                    req_stats=req_stats,
+                    py_stats_extra=py_stats_extra,
+                ))
 
     def _process_iter_stats(
         self,

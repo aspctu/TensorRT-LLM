@@ -665,9 +665,10 @@ class BaseWorker(GenerationExecutor):
     @staticmethod
     def _stats_serializer(
             stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-        py_stats_extra = None
-        if len(stats) == 3:
-            iteration_stats, req_stats, py_stats_extra = stats
+        py_stats_extra = getattr(stats, "py_stats_extra", None)
+        if hasattr(stats, "iteration_stats"):
+            iteration_stats = stats.iteration_stats
+            req_stats = stats.req_stats
         else:
             iteration_stats, req_stats = stats
 

@@ -93,6 +93,11 @@ public:
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
+    [[nodiscard]] bool usesTierAwareFairness() const noexcept
+    {
+        return mTierAwareEviction;
+    }
+
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
         RequestList const& activeRequests) const;
@@ -175,6 +180,9 @@ private:
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,
         StaticBatchScheduler>
         mScheduler;
+    // CapacityScheduler is owned by the batch-manager event loop and invoked
+    // serially. This cache intentionally persists small org fairness state
+    // across iterations for the tier-aware MAX_UTILIZATION policy only.
     mutable std::unordered_map<std::uint64_t, double> mSchedulerOrgFairnessStates;
 };
 

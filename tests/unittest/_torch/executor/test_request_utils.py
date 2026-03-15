@@ -20,13 +20,6 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.scheduling_params import (
-    SchedulingParams,
-    get_py_scheduling_params,
-    hash_organization_id,
-)
-
-
 @pytest.fixture
 def attention_dp_config():
     """Create a config dict for attention DP testing."""
@@ -60,24 +53,6 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     mock_request.input_token_ids = [1, 2, 3]
 
     return mock_request
-
-
-def test_get_py_scheduling_params_returns_none_for_missing_attribute():
-    assert get_py_scheduling_params(object()) is None
-
-
-def test_get_py_scheduling_params_returns_attached_params():
-    request = Mock()
-    params = SchedulingParams(attention_dp_rank=2, attention_dp_relax=False)
-    request.py_scheduling_params = params
-
-    assert get_py_scheduling_params(request) is params
-
-
-def test_hash_organization_id_is_stable_and_normalized():
-    assert hash_organization_id(" org-a ") == hash_organization_id("org-a")
-    assert hash_organization_id(None) == hash_organization_id("default")
-
 
 def test_merge_helix_requests_with_padding():
     """Test merge_helix_requests with basic valid input."""

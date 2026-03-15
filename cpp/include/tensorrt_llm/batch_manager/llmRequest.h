@@ -687,11 +687,6 @@ public:
         return getMaxBeamNumTokens() - mPromptLen;
     }
 
-    [[nodiscard]] SizeType32 getMaxNewTokens() const
-    {
-        return mMaxNewTokens;
-    }
-
     /// @brief Returns true if request reaches max number of tokens in the next iteration.
     [[nodiscard]] bool willCompleteNextIteration() const
     {
@@ -1317,16 +1312,6 @@ public:
     void setSchedulerOrganizationHash(std::uint64_t organizationHash) noexcept
     {
         mSchedulerOrganizationHash = organizationHash;
-    }
-
-    [[nodiscard]] bool getSchedulerControlsEnabled() const noexcept
-    {
-        return mSchedulerControlsEnabled;
-    }
-
-    void setSchedulerControlsEnabled(bool enabled) noexcept
-    {
-        mSchedulerControlsEnabled = enabled;
     }
 
     [[nodiscard]] double getSchedulerCredit() const noexcept
@@ -2096,7 +2081,6 @@ protected:
 
     executor::PriorityType mPriority;
     std::uint64_t mSchedulerOrganizationHash{0};
-    bool mSchedulerControlsEnabled{false};
     double mSchedulerCredit{0.0};
     SizeType32 mSchedulerPauseCount{0};
     double mSchedulerScore{0.0};

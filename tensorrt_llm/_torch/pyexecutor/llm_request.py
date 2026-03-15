@@ -1042,7 +1042,6 @@ def executor_request_to_llm_request(
                                                   "py_disaggregated_params",
                                                   None)
     llm_request.py_priority_tier = priority_tier
-    llm_request.scheduler_controls_enabled = True
     llm_request.scheduler_organization_hash = hash_organization_id(
         organization_id)
     llm_request.py_scheduler_enqueue_time = getattr(

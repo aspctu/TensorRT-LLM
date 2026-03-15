@@ -149,8 +149,6 @@ void initBindings(nb::module_& m)
         .def("set_priority", nb::overload_cast<tle::PriorityType>(&GenLlmReq::setPriority))
         .def_prop_rw("scheduler_organization_hash", &GenLlmReq::getSchedulerOrganizationHash,
             &GenLlmReq::setSchedulerOrganizationHash)
-        .def_prop_rw(
-            "scheduler_controls_enabled", &GenLlmReq::getSchedulerControlsEnabled, &GenLlmReq::setSchedulerControlsEnabled)
         .def_prop_rw("scheduler_credit", &GenLlmReq::getSchedulerCredit, &GenLlmReq::setSchedulerCredit)
         .def_prop_rw("scheduler_pause_count", &GenLlmReq::getSchedulerPauseCount, &GenLlmReq::setSchedulerPauseCount)
         .def_prop_rw("scheduler_score", &GenLlmReq::getSchedulerScore, &GenLlmReq::setSchedulerScore)
