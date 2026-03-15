@@ -77,7 +77,8 @@ python3 .local/run_scheduler_simulation.py \
   --output-markdown /tmp/trtllm-scheduler-sim-heavy.md
 ```
 
-The simulator compares:
+The simulator compares a local exploratory policy, not the tracked runtime
+scheduler implementation:
 
 - baseline: `stock_default`
 - candidate: `vtc_tier_shares`
