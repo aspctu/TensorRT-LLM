@@ -12,8 +12,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm.bindings import steady_clock_now
 from tensorrt_llm.llmapi import DisaggScheduleStyle
+from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 try:
     from cuda.bindings import runtime as cudart
@@ -60,9 +60,6 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
-from .request_metadata import (RequestStatsExtra, request_organization_id,
-                               request_organization_key,
-                               request_priority_tier)
 from .resource_manager import (ResourceManager, ResourceManagerType,
                                request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
@@ -80,28 +77,6 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
-
-
-def get_steady_clock_now_in_seconds() -> float:
-    return steady_clock_now().total_seconds()
-
-
-def _priority_counts(requests: Iterable[object]) -> Dict[str, int]:
-    from collections import Counter
-    counts = Counter(request_priority_tier(request) for request in requests)
-    return {
-        str(priority_tier): count
-        for priority_tier, count in sorted(counts.items())
-    }
-
-
-def _organization_counts(requests: Iterable[object]) -> Dict[str, int]:
-    from collections import Counter
-    counts = Counter(request_organization_key(request) for request in requests)
-    return {
-        organization_key: count
-        for organization_key, count in sorted(counts.items())
-    }
 
 
 class PPCommTag(IntEnum):
@@ -513,7 +488,8 @@ class PyExecutor:
                                                       self.hang_detector)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
-        self.waiting_queue: WaitingQueue = create_waiting_queue(waiting_queue_policy)
+        self.waiting_queue: WaitingQueue = create_waiting_queue(
+            waiting_queue_policy)
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -980,39 +956,7 @@ class PyExecutor:
             self, finished_requests: List[LlmRequest],
             active_requests: List[LlmRequest],
             scheduled_requests: ScheduledRequests
-    ) -> tuple[
-            Optional[List[RequestStats]],
-            Dict[int, RequestStatsExtra],
-    ]:
-
-        req_stats_extra: Dict[int, RequestStatsExtra] = {}
-
-        def add_req_stats_extra(request_id: int, request: Optional[object]) -> None:
-            def get_metric(cpp_attr: str, py_attr: str, default: object) -> object:
-                if request is None:
-                    return default
-                try:
-                    return getattr(request, cpp_attr)
-                except AttributeError:
-                    return getattr(request, py_attr, default)
-
-            req_stats_extra[request_id] = RequestStatsExtra(
-                priorityTier=request_priority_tier(request),
-                priorityCredit=float(
-                    get_metric("scheduler_credit", "py_priority_credit", 0.0)),
-                priorityPauseCount=int(
-                    get_metric("scheduler_pause_count",
-                               "py_priority_pause_count", 0)),
-                organizationId=request_organization_id(request),
-                schedulerScore=float(
-                    get_metric("scheduler_score", "py_scheduler_score", 0.0)),
-                schedulerAgeCredit=float(
-                    get_metric("scheduler_age_credit",
-                               "py_scheduler_age_credit", 0.0)),
-                schedulerOrgTokenBalance=float(
-                    get_metric("scheduler_org_token_balance",
-                               "py_scheduler_org_token_balance", 0.0)),
-            )
+    ) -> Optional[List[RequestStats]]:
 
         def get_req_stats(req: LlmRequest) -> RequestStats:
             req_stat = RequestStats()
@@ -1026,17 +970,15 @@ class PyExecutor:
             req_stat.missed_blocks_per_request = req.missed_blocks
             req_stat.kv_cache_hit_rate_per_request = req.kv_cache_hit_rate
             req_stat.scheduled = req in scheduled_requests.context_requests or req in scheduled_requests.generation_requests
-            req_stat.paused = req in scheduled_requests.paused_requests
             if req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY or req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 req_stat.dis_serving_stats = DisServingRequestStats()
                 req_stat.dis_serving_stats.kv_cache_transfer_ms = req.kv_cache_transfer_time_ms
                 req_stat.dis_serving_stats.kv_cache_size = req.kv_cache_size
-            add_req_stats_extra(req.request_id, req)
             return req_stat
 
-        def get_queued_req_stats(req_item: RequestQueueItem) -> RequestStats:
+        def get_queued_req_stats(request_id: int) -> RequestStats:
             req_stat = RequestStats()
-            req_stat.id = req_item.id
+            req_stat.id = request_id
             req_stat.context_prefill_position = 0
             req_stat.num_generated_tokens = 0
             req_stat.avg_num_decoded_tokens_per_iter = 0
@@ -1045,9 +987,6 @@ class PyExecutor:
             req_stat.reused_blocks_per_request = 0
             req_stat.missed_blocks_per_request = 0
             req_stat.kv_cache_hit_rate_per_request = 0
-            req_stat.scheduled = False
-            req_stat.paused = False
-            add_req_stats_extra(req_item.id, req_item.request)
             return req_stat
 
         req_stats = []
@@ -1058,7 +997,7 @@ class PyExecutor:
 
         for req in list(self.executor_request_queue.get_request_queue().queue):
             if isinstance(req, RequestQueueItem):
-                req_stat = get_queued_req_stats(req)
+                req_stat = get_queued_req_stats(req.id)
                 req_stat.stage = RequestStage.QUEUED
                 req_stats.append(req_stat)
 
@@ -1067,40 +1006,7 @@ class PyExecutor:
             req_stat.stage = RequestStage.GENERATION_COMPLETE
             req_stats.append(req_stat)
 
-        return req_stats, req_stats_extra
-
-    def _build_priority_stats(self, active_requests: List[LlmRequest],
-                              scheduled_batch: ScheduledRequests) -> Dict[str,
-                                                                          Dict[
-                                                                              str,
-                                                                              int]]:
-        queued_requests, waiting_requests = self._collect_waiting_and_queued_requests()
-        scheduled_context_requests = list(scheduled_batch.context_requests)
-        scheduled_generation_requests = list(scheduled_batch.generation_requests)
-
-        return {
-            "active": _priority_counts(active_requests),
-            "queued": _priority_counts(queued_requests),
-            "waiting": _priority_counts(waiting_requests),
-            "scheduled": _priority_counts(
-                scheduled_context_requests + scheduled_generation_requests),
-            "scheduledContext": _priority_counts(scheduled_context_requests),
-            "scheduledGeneration": _priority_counts(
-                scheduled_generation_requests),
-            "paused": _priority_counts(scheduled_batch.paused_requests),
-        }
-
-    def _build_organization_stats(
-            self, active_requests: List[LlmRequest],
-            scheduled_batch: ScheduledRequests) -> Dict[str, Dict[str, Union[
-                int, float]]]:
-        queued_requests, waiting_requests = self._collect_waiting_and_queued_requests()
-
-        return {
-            "active": _organization_counts(active_requests),
-            "queued": _organization_counts(queued_requests),
-            "waiting": _organization_counts(waiting_requests),
-        }
+        return req_stats
 
     def _build_tier_stats(
         self,
@@ -1253,11 +1159,11 @@ class PyExecutor:
         if batch_state.iter_stats is None:
             return
 
-        req_stats, req_stats_extra = self._populate_req_stats(
+        req_stats = self._populate_req_stats(
             finished_requests, active_requests,
             batch_state.scheduled_requests) if (
                 self.enable_iter_req_stats
-                and self.enable_iter_perf_stats) else (None, {})
+                and self.enable_iter_perf_stats) else None
 
         self.tier_runtime_stats.observe_iteration(
             active_requests=active_requests,
@@ -1267,10 +1173,7 @@ class PyExecutor:
             now=tier_stats_time,
         )
 
-        py_stats_extra: Dict[str, object] = {
-            "priorityStats": self._build_priority_stats(
-                active_requests, batch_state.scheduled_requests)
-        }
+        py_stats_extra: Dict[str, object] = {}
         tier_stats = self._build_tier_stats(
             active_requests,
             batch_state.scheduled_requests,
@@ -1278,12 +1181,6 @@ class PyExecutor:
         )
         if tier_stats:
             py_stats_extra["tierStats"] = tier_stats
-        organization_stats = self._build_organization_stats(
-            active_requests, batch_state.scheduled_requests)
-        if organization_stats:
-            py_stats_extra["organizationStats"] = organization_stats
-        if req_stats_extra:
-            py_stats_extra["requestStatsExtra"] = req_stats_extra
 
         self._append_iter_stats(
             self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
@@ -1291,7 +1188,7 @@ class PyExecutor:
                                     batch_state.scheduled_requests,
                                     micro_batch_id),
             req_stats,
-            py_stats_extra)
+            py_stats_extra or None)
 
     def _executor_loop_cleanup(self):
 
@@ -1473,6 +1370,8 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+
+                    self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
@@ -1776,6 +1675,55 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def _handle_dynamic_draft_len(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
+        """Handle dynamic draft length for the current batch.
+
+        Must be called BEFORE prepare_resources so that KV cache allocation
+        uses the correct draft length.
+
+        Two things happen here:
+        1. Determine the runtime draft length from the draft_len_schedule
+           based on the current batch size, and store it on model_engine so
+           that the rest of the forward path can read it.
+        2. Pad / truncate each request's py_draft_tokens to exactly match
+           the determined draft length, ensuring uniform draft token counts across the
+           batch (required by CUDA graph replay and the attention kernel).
+
+        When dynamic draft length is not enabled, runtime_draft_len is simply
+        set to max_draft_len (the static maximum).
+        """
+        if not hasattr(self.model_engine, 'max_draft_len'):
+            return
+
+        if (self.model_engine.spec_config is not None
+                and self.model_engine.spec_config.draft_len_schedule is not None
+                and self.model_engine.spec_config.spec_dec_mode.
+                support_dynamic_draft_len()):
+            from tensorrt_llm._torch.speculative.utils import \
+                get_draft_len_for_batch_size
+
+            # 1. Resolve runtime draft length from schedule
+            runtime_draft_len = get_draft_len_for_batch_size(
+                self.model_engine.spec_config.draft_len_schedule,
+                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+
+            # 2. Pad or truncate draft tokens to the resolved length
+            PADDING_TOKEN = 0
+            for request in scheduled_batch.generation_requests:
+                current_draft_len = len(request.py_draft_tokens)
+                if current_draft_len < runtime_draft_len:
+                    padding_needed = runtime_draft_len - current_draft_len
+                    request.py_draft_tokens.extend([PADDING_TOKEN] *
+                                                   padding_needed)
+                elif current_draft_len > runtime_draft_len:
+                    request.py_draft_tokens = request.py_draft_tokens[:
+                                                                      runtime_draft_len]
+
+            self.model_engine.runtime_draft_len = runtime_draft_len
+        else:
+            self.model_engine.runtime_draft_len = self.model_engine.max_draft_len
+
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -1953,6 +1901,9 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
@@ -2218,6 +2169,8 @@ class PyExecutor:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
 
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
@@ -2480,6 +2433,7 @@ class PyExecutor:
         return self.sampler.SampleState(
             scheduled_requests=scheduled_batch,
             sampler_event=SamplerEvent(cuda_event=sampler_event),
+            runtime_draft_len=self.model_engine.runtime_draft_len,
         )
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:
@@ -2569,7 +2523,6 @@ class PyExecutor:
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
-        active_requests: List[LlmRequest],
         total_num_active_requests: int,
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
@@ -2618,7 +2571,7 @@ class PyExecutor:
 
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
-            waiting_queue, active_requests, total_num_active_requests,
+            waiting_queue, total_num_active_requests,
             all_ranks_num_active_requests)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)

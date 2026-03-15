@@ -11,8 +11,6 @@ from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
 from tensorrt_llm.scheduling_params import (
-    get_organization_id,
-    get_priority_tier,
     get_py_scheduling_params,
     hash_organization_id,
     normalize_organization_id,
@@ -946,8 +944,10 @@ def executor_request_to_llm_request(
     stop_words_list = convert_wordlist(
         executor_request.stop_words) if executor_request.stop_words else None
     scheduling_params = get_py_scheduling_params(executor_request)
-    priority_tier = normalize_priority_tier(get_priority_tier(scheduling_params))
-    organization_id = normalize_organization_id(get_organization_id(scheduling_params))
+    priority_tier = normalize_priority_tier(
+        0 if scheduling_params is None else scheduling_params.priority_tier)
+    organization_id = normalize_organization_id(
+        None if scheduling_params is None else scheduling_params.organization_id)
 
     # Extract multimodal fields from executor request
     multimodal_hashes = None
@@ -1041,9 +1041,7 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
-    llm_request.py_scheduling_params = scheduling_params
     llm_request.py_priority_tier = priority_tier
-    llm_request.py_organization_id = organization_id
     llm_request.scheduler_controls_enabled = True
     llm_request.scheduler_organization_hash = hash_organization_id(
         organization_id)

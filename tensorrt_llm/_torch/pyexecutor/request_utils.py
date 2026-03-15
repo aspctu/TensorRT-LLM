@@ -10,7 +10,6 @@ import torch
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.scheduling_params import get_py_scheduling_params
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
@@ -84,7 +83,7 @@ def can_process_attention_dp_request(
     Returns:
         True if the request can be processed, False otherwise.
     """
-    scheduling_params = get_py_scheduling_params(req_item.request)
+    scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
     if scheduling_params is None:
         return True
 

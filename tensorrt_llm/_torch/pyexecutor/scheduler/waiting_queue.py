@@ -122,11 +122,12 @@ def create_waiting_queue(
 
     Args:
         policy: The scheduling policy to use. Currently only FCFS is supported.
-        priority_fn: Optional priority function for priority-aware queue ordering.
+        priority_fn: Reserved for future use.
 
     Returns:
         A WaitingQueue instance.
     """
+    # Currently only FCFS is implemented
     if policy == WaitingQueuePolicy.FCFS:
         return FCFSWaitingQueue()
     else:

@@ -1,5 +1,4 @@
 import copy
-import dataclasses
 import datetime
 import enum
 import json
@@ -663,18 +662,6 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
-    # Define a Callable to join iteration and request stats
-    @staticmethod
-    def _request_stats_extra_to_dict(extra: object) -> Dict[str, object]:
-        to_dict = getattr(extra, "to_dict", None)
-        if callable(to_dict):
-            return to_dict()
-        if isinstance(extra, dict):
-            return extra
-        if dataclasses.is_dataclass(extra):
-            return dataclasses.asdict(extra)
-        raise TypeError(f"Unsupported request stats extra payload: {type(extra)!r}")
-
     @staticmethod
     def _stats_serializer(
             stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
@@ -687,24 +674,15 @@ class BaseWorker(GenerationExecutor):
         stats_dict = json.loads(iteration_stats.to_json_str())
         if py_stats_extra is not None:
             for key, value in py_stats_extra.items():
-                if key == "requestStatsExtra" or value is None:
+                if value is None:
                     continue
                 stats_dict[key] = value
 
         if req_stats is not None and len(req_stats) > 0:
-            request_stats_extra = {}
-            if py_stats_extra is not None:
-                request_stats_extra = py_stats_extra.get(
-                    "requestStatsExtra", {})
             stats_dict["requestStats"] = []
             for req_stat in req_stats:
-                req_stats_dict = json.loads(req_stat.to_json_str())
-                req_id = req_stats_dict.get("id")
-                if req_id in request_stats_extra:
-                    req_stats_dict.update(
-                        BaseWorker._request_stats_extra_to_dict(
-                            request_stats_extra[req_id]))
-                stats_dict["requestStats"].append(req_stats_dict)
+                stats_dict["requestStats"].append(
+                    json.loads(req_stat.to_json_str()))
 
         # Convert back to JSON string
         return json.dumps(stats_dict)

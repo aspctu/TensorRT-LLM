@@ -1,18 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, Protocol, cast
+from typing import Optional
 
 DEFAULT_ORGANIZATION_ID = "default"
-
-
-class SchedulingParamsLike(Protocol):
-    attention_dp_rank: Optional[int]
-    attention_dp_relax: Optional[bool]
-    priority_tier: int
-    organization_id: Optional[str]
-
-
-class HasSchedulingParams(Protocol):
-    py_scheduling_params: Optional[SchedulingParamsLike]
 
 
 def normalize_priority_tier(priority_tier: object) -> int:
@@ -40,7 +29,7 @@ class SchedulingParams:
     organization_id: Optional[str] = None
 
 
-def get_py_scheduling_params(request: object) -> Optional[SchedulingParamsLike]:
+def get_py_scheduling_params(request: object) -> Optional[SchedulingParams]:
     """Return Python-only scheduling params attached to a request-like object.
 
     Missing `py_scheduling_params` is treated as absent configuration. Only
@@ -48,21 +37,9 @@ def get_py_scheduling_params(request: object) -> Optional[SchedulingParamsLike]:
     """
 
     try:
-        return cast(HasSchedulingParams, request).py_scheduling_params
+        return request.py_scheduling_params
     except AttributeError:
         return None
-
-
-def get_priority_tier(scheduling_params: Optional[SchedulingParamsLike]) -> int:
-    if scheduling_params is None:
-        return 0
-    return scheduling_params.priority_tier
-
-
-def get_organization_id(scheduling_params: Optional[SchedulingParamsLike]) -> Optional[str]:
-    if scheduling_params is None:
-        return None
-    return scheduling_params.organization_id
 
 
 def normalize_organization_id(organization_id: Optional[str]) -> str:

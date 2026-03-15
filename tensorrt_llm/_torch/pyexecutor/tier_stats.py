@@ -2,11 +2,14 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Iterable, Optional
 
-from .request_metadata import request_priority_tier, scheduled_token_cost
+from tensorrt_llm.scheduling_params import get_py_scheduling_params, normalize_priority_tier
+
 from .scheduler import ScheduledRequests
 
 LATENCY_SAMPLE_LIMIT = 256
 THROUGHPUT_WINDOW_SECONDS = 30.0
+
+_MISSING = object()
 
 
 @dataclass(slots=True)
@@ -21,6 +24,58 @@ class _ThroughputSample:
     duration_s: float
     generated_tokens: int
     service_tokens: int
+
+
+def request_priority_tier(request_or_item: object) -> int:
+    if request_or_item is None:
+        return 0
+
+    request = getattr(request_or_item, "request", _MISSING)
+    if request is _MISSING:
+        request = request_or_item
+    if request is None:
+        return 0
+
+    priority_tier = getattr(request, "py_priority_tier", _MISSING)
+    if priority_tier is not _MISSING:
+        return normalize_priority_tier(priority_tier)
+
+    scheduling_params = get_py_scheduling_params(request)
+    return normalize_priority_tier(
+        0 if scheduling_params is None else scheduling_params.priority_tier)
+
+
+def scheduled_token_cost(request: object) -> int:
+    if getattr(request, "is_encoder_init_state", False):
+        return max(1, int(getattr(request, "encoder_output_len", 1)))
+
+    if getattr(request, "is_context_init_state", False) or getattr(
+        request, "is_disagg_generation_init_state", False
+    ):
+        chunk_size = int(
+            getattr(
+                request,
+                "context_chunk_size",
+                getattr(request, "context_remaining_length", 0),
+            )
+            or 0
+        )
+        if chunk_size <= 0 and hasattr(request, "get_num_tokens"):
+            chunk_size = int(request.get_num_tokens(0))
+
+        draft_tokens = 0
+        if getattr(request, "has_draft_tokens", False) and getattr(
+            request, "is_last_context_chunk", False
+        ):
+            draft_tokens = int(getattr(request, "num_draft_tokens", 0))
+        return max(1, chunk_size + draft_tokens)
+
+    if hasattr(request, "get_beam_width_by_iter"):
+        beam_width = int(request.get_beam_width_by_iter(for_next_iteration=False))
+    else:
+        sampling_config = getattr(request, "sampling_config", None)
+        beam_width = int(getattr(sampling_config, "beam_width", 1))
+    return max(1, beam_width + int(getattr(request, "num_draft_tokens", 0)))
 
 
 def _request_id(request: object) -> Optional[int]:
