@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
 from ..llm_request import LlmRequest, LlmRequestState
+from ..scheduler_fairness import SchedulerFairnessController
 
 RequestList = list[LlmRequest]
 
@@ -381,6 +383,7 @@ class SimpleScheduler(RequestScheduler):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
+        self.fairness_controller = SchedulerFairnessController()
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -930,6 +933,54 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
     C++ reference: capacityScheduler.cpp:341-425
     """
 
+    def __init__(self, tier_aware_eviction: bool = False) -> None:
+        self.tier_aware_eviction = tier_aware_eviction
+
+    def _select_pause_victim_index(
+        self,
+        requests_list: RequestList,
+        *,
+        req_it: int,
+        req_it_end: int,
+        current_request: LlmRequest,
+        is_started_request,
+    ) -> Optional[int]:
+        if not self.tier_aware_eviction:
+            for i in range(req_it_end - 1, req_it - 1, -1):
+                if is_started_request(requests_list[i]):
+                    return i
+            return None
+
+        current_tier = max(0, int(math.floor(current_request.priority())))
+        best_idx: Optional[int] = None
+        best_tier: Optional[int] = None
+        best_score: Optional[float] = None
+        for i in range(req_it, req_it_end):
+            candidate = requests_list[i]
+            if not is_started_request(candidate):
+                continue
+
+            candidate_tier = max(0, int(math.floor(candidate.priority())))
+            if candidate_tier > current_tier:
+                continue
+
+            if getattr(candidate, "scheduler_controls_enabled", False):
+                candidate_score = candidate.scheduler_score
+            else:
+                candidate_score = candidate.priority()
+
+            if (
+                best_idx is None
+                or candidate_tier < best_tier
+                or (candidate_tier == best_tier and candidate_score < best_score)
+                or (candidate_tier == best_tier and candidate_score == best_score)
+            ):
+                best_idx = i
+                best_tier = candidate_tier
+                best_score = candidate_score
+
+        return best_idx
+
     def schedule(
         self, scheduler: "PyCapacityScheduler", active_requests: RequestList
     ) -> tuple[RequestList, RequestList]:
@@ -991,11 +1042,13 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 logger.debug(f"MaxUtilizationScheduler: request ID {req.request_id} -> start")
                 req_it += 1
             else:
-                last_started_idx = None
-                for i in range(req_it_end - 1, req_it - 1, -1):
-                    if is_started_request(requests_list[i]):
-                        last_started_idx = i
-                        break
+                last_started_idx = self._select_pause_victim_index(
+                    requests_list,
+                    req_it=req_it,
+                    req_it_end=req_it_end,
+                    current_request=req,
+                    is_started_request=is_started_request,
+                )
 
                 if last_started_idx is not None:
                     paused_req = requests_list[last_started_idx]
@@ -1204,6 +1257,8 @@ class PyCapacityScheduler:
             return MaxRequestsPolicy()
         elif self.scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
             return MaxUtilizationPolicy()
+        elif self.scheduler_policy == CapacitySchedulerPolicy.TIER_AWARE_MAX_UTILIZATION:
+            return MaxUtilizationPolicy(tier_aware_eviction=True)
         elif self.scheduler_policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             return GuaranteedNoEvictPolicy(static_batch=False)
         elif self.scheduler_policy == CapacitySchedulerPolicy.STATIC_BATCH:
@@ -1426,8 +1481,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
         capacity = scheduler_capacity if scheduler_capacity is not None else max_batch_size
 
-        # 1. Initialize Python Capacity Scheduler
-        # Now fully aligned with C++ CapacityScheduler
+        self.fairness_controller = SchedulerFairnessController()
         self.capacity_scheduler = PyCapacityScheduler(
             max_num_requests=capacity,
             kv_cache_manager=kv_cache_manager,

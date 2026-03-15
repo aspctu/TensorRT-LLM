@@ -187,3 +187,41 @@ class TestCreateWaitingQueue:
         """Test creating queue with default policy."""
         queue = create_waiting_queue()
         assert isinstance(queue, FCFSWaitingQueue)
+
+    def test_create_priority_queue(self):
+        """Test creating a priority-aware waiting queue."""
+        queue = create_waiting_queue(
+            WaitingQueuePolicy.FCFS, priority_fn=lambda req_item: req_item.id
+        )
+        assert not isinstance(queue, FCFSWaitingQueue)
+
+    def test_priority_queue_prefers_higher_tier(self):
+        """Higher priority tiers should be dequeued first."""
+        queue = create_waiting_queue(
+            WaitingQueuePolicy.FCFS,
+            priority_fn=lambda req_item: getattr(req_item.request.py_scheduling_params, "priority_tier", 0) * 6.0,
+        )
+
+        low = create_mock_request_item(1)
+        low.request.py_scheduling_params = Mock(priority_tier=0)
+        high = create_mock_request_item(2)
+        high.request.py_scheduling_params = Mock(priority_tier=2)
+
+        queue.add_requests([low, high])
+
+        assert queue.pop_request().id == 2
+        assert queue.pop_request().id == 1
+
+    def test_priority_queue_preserves_fifo_for_equal_scores(self):
+        """Equal scores should preserve arrival order."""
+        queue = create_waiting_queue(
+            WaitingQueuePolicy.FCFS,
+            priority_fn=lambda req_item: 1.0,
+        )
+
+        first = create_mock_request_item(1)
+        second = create_mock_request_item(2)
+        queue.add_requests([first, second])
+
+        assert queue.pop_request().id == 1
+        assert queue.pop_request().id == 2

@@ -10,6 +10,14 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
+from tensorrt_llm.scheduling_params import (
+    get_organization_id,
+    get_priority_tier,
+    get_py_scheduling_params,
+    hash_organization_id,
+    normalize_organization_id,
+    normalize_priority_tier,
+)
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -937,6 +945,9 @@ def executor_request_to_llm_request(
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     stop_words_list = convert_wordlist(
         executor_request.stop_words) if executor_request.stop_words else None
+    scheduling_params = get_py_scheduling_params(executor_request)
+    priority_tier = normalize_priority_tier(get_priority_tier(scheduling_params))
+    organization_id = normalize_organization_id(get_organization_id(scheduling_params))
 
     # Extract multimodal fields from executor request
     multimodal_hashes = None
@@ -1015,7 +1026,7 @@ def executor_request_to_llm_request(
         return_encoder_output=False,
         client_id=executor_request.client_id
         if executor_request.client_id is not None else req_id,
-        priority=0.5,
+        priority=0.5 + priority_tier,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt_id=executor_request.cache_salt_id,
@@ -1030,6 +1041,14 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.py_scheduling_params = scheduling_params
+    llm_request.py_priority_tier = priority_tier
+    llm_request.py_organization_id = organization_id
+    llm_request.scheduler_controls_enabled = True
+    llm_request.scheduler_organization_hash = hash_organization_id(
+        organization_id)
+    llm_request.py_scheduler_enqueue_time = getattr(
+        executor_request, "py_scheduler_enqueue_time", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

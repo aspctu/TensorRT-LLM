@@ -687,6 +687,11 @@ public:
         return getMaxBeamNumTokens() - mPromptLen;
     }
 
+    [[nodiscard]] SizeType32 getMaxNewTokens() const
+    {
+        return mMaxNewTokens;
+    }
+
     /// @brief Returns true if request reaches max number of tokens in the next iteration.
     [[nodiscard]] bool willCompleteNextIteration() const
     {
@@ -1302,6 +1307,66 @@ public:
     void setPriority(executor::PriorityType priority) noexcept
     {
         mPriority = priority;
+    }
+
+    [[nodiscard]] std::uint64_t getSchedulerOrganizationHash() const noexcept
+    {
+        return mSchedulerOrganizationHash;
+    }
+
+    void setSchedulerOrganizationHash(std::uint64_t organizationHash) noexcept
+    {
+        mSchedulerOrganizationHash = organizationHash;
+    }
+
+    [[nodiscard]] bool getSchedulerControlsEnabled() const noexcept
+    {
+        return mSchedulerControlsEnabled;
+    }
+
+    void setSchedulerControlsEnabled(bool enabled) noexcept
+    {
+        mSchedulerControlsEnabled = enabled;
+    }
+
+    [[nodiscard]] double getSchedulerCredit() const noexcept
+    {
+        return mSchedulerCredit;
+    }
+
+    void setSchedulerCredit(double credit) noexcept
+    {
+        mSchedulerCredit = credit;
+    }
+
+    [[nodiscard]] SizeType32 getSchedulerPauseCount() const noexcept
+    {
+        return mSchedulerPauseCount;
+    }
+
+    void setSchedulerPauseCount(SizeType32 pauseCount) noexcept
+    {
+        mSchedulerPauseCount = pauseCount;
+    }
+
+    [[nodiscard]] double getSchedulerScore() const noexcept
+    {
+        return mSchedulerScore;
+    }
+
+    void setSchedulerScore(double score) noexcept
+    {
+        mSchedulerScore = score;
+    }
+
+    [[nodiscard]] double getSchedulerAgeCredit() const noexcept
+    {
+        return mSchedulerAgeCredit;
+    }
+
+    void setSchedulerAgeCredit(double ageCredit) noexcept
+    {
+        mSchedulerAgeCredit = ageCredit;
     }
 
     void setReturnAllGeneratedTokens(bool const returnAllGeneratedTokens)
@@ -2030,6 +2095,12 @@ protected:
     SizeType32 mDecodingIter{0};
 
     executor::PriorityType mPriority;
+    std::uint64_t mSchedulerOrganizationHash{0};
+    bool mSchedulerControlsEnabled{false};
+    double mSchedulerCredit{0.0};
+    SizeType32 mSchedulerPauseCount{0};
+    double mSchedulerScore{0.0};
+    double mSchedulerAgeCredit{0.0};
 
     std::vector<executor::FinishReason> mFinishReasons;
 

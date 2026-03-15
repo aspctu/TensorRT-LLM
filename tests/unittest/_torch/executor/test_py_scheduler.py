@@ -1339,6 +1339,28 @@ class TestPyCapacitySchedulerMaxUtilization:
         assert len(fitting) == 0
         assert len(paused) == 0
 
+    def test_tier_aware_eviction_prefers_lower_tier_started_request(self):
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=1,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.TIER_AWARE_MAX_UTILIZATION,
+        )
+
+        high_context = make_context_request(0)
+        low_started = make_generation_request(1)
+        high_started = make_generation_request(2)
+        high_context.set_priority(4.0)
+        low_started.set_priority(0.0)
+        high_started.set_priority(4.0)
+
+        fitting, disagg, paused = scheduler.schedule_request(
+            [high_context, low_started, high_started]
+        )
+        assert len(disagg) == 0
+        assert [req.request_id for req in fitting] == [0]
+        assert [req.request_id for req in paused] == [1]
+
 
 class TestPyCapacitySchedulerStaticBatch:
     """

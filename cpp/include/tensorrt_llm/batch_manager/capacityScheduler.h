@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
+#include <unordered_map>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager
@@ -88,7 +89,7 @@ private:
 class MaxUtilizationScheduler : public BaseCapacityScheduler
 {
 public:
-    MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
+    MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead, bool tierAwareEviction = false,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
@@ -100,6 +101,8 @@ private:
     SizeType32 mMaxNumRequests;
     /// @brief Boolean that indicates if two step lookahead is enabled
     bool mTwoStepsLookAhead;
+    /// @brief When enabled, pause victims are chosen explicitly by lowest tier then lowest fairness score.
+    bool mTierAwareEviction;
 };
 
 /// @brief Schedule requests using the GUARANTEED_NO_EVICT policy
@@ -168,9 +171,11 @@ public:
         OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;
 
 private:
+    SizeType32 mMaxNumRequests;
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,
         StaticBatchScheduler>
         mScheduler;
+    mutable std::unordered_map<std::uint64_t, double> mSchedulerOrgFairnessStates;
 };
 
 } // namespace tensorrt_llm::batch_manager

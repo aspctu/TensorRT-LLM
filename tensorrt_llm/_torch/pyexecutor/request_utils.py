@@ -1,15 +1,18 @@
 """Utility functions for request processing."""
 
 import os
+from collections import deque
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
+    from .scheduler_fairness import SchedulerFairnessController
     from .scheduler import WaitingQueue
 
 import torch
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.mapping import CpType
+from tensorrt_llm.scheduling_params import get_py_scheduling_params
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
@@ -83,7 +86,7 @@ def can_process_attention_dp_request(
     Returns:
         True if the request can be processed, False otherwise.
     """
-    scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+    scheduling_params = get_py_scheduling_params(req_item.request)
     if scheduling_params is None:
         return True
 
@@ -104,6 +107,9 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[List[int]] = None,
+    active_requests: Optional[List[object]] = None,
+    scheduler_fairness: Optional["SchedulerFairnessController"] = None,
+    max_service_requests: Optional[int] = None,
 ) -> List:
     """Get requests from the waiting queue.
 
@@ -119,6 +125,8 @@ def get_from_waiting_queue(
     """
     if max_req_count <= 0:
         return []
+    if max_service_requests is None:
+        max_service_requests = max_num_active_requests
 
     req_count = 0
     items = []
@@ -129,12 +137,36 @@ def get_from_waiting_queue(
         all_ranks_num_active_requests.copy() if enable_attention_dp else None
     )
 
-    while req_count < max_req_count and waiting_queue:
-        req_item = waiting_queue.peek_request()
+    if scheduler_fairness is None or active_requests is None:
+        ordered_waiting_items = None
+    else:
+        ordered_waiting_items = deque(
+            scheduler_fairness.select_waiting_requests(
+                list(waiting_queue),
+                active_requests,
+                max_req_count,
+                max_num_active_requests,
+                max_service_requests=max_service_requests,
+            )
+        )
+        waiting_queue.remove_by_ids({req_item.id for req_item in ordered_waiting_items})
+
+    while req_count < max_req_count and (
+        waiting_queue if ordered_waiting_items is None else ordered_waiting_items
+    ):
+        if ordered_waiting_items is None:
+            req_item = waiting_queue.peek_request()
+        else:
+            req_item = ordered_waiting_items[0]
+
         num_children = len(req_item.child_req_ids) if req_item.child_req_ids else 0
         if (req_count + 1 + num_children) > max_req_count:
             break
-        req_item = waiting_queue.pop_request()
+
+        if ordered_waiting_items is None:
+            req_item = waiting_queue.pop_request()
+        else:
+            req_item = ordered_waiting_items.popleft()
 
         can_process = (
             can_process_attention_dp_request(
@@ -153,6 +185,9 @@ def get_from_waiting_queue(
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
     waiting_queue.prepend_requests(reversed(pending_requests))
+
+    if ordered_waiting_items is not None:
+        waiting_queue.prepend_requests(reversed(ordered_waiting_items))
 
     return items
 

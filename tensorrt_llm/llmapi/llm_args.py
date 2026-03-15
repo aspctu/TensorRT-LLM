@@ -1759,6 +1759,7 @@ class BatchingType(StrEnum, metaclass=PybindMirrorEnumMeta):
 @PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
 class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     MAX_UTILIZATION = "MAX_UTILIZATION"
+    TIER_AWARE_MAX_UTILIZATION = "TIER_AWARE_MAX_UTILIZATION"
     GUARANTEED_NO_EVICT = "GUARANTEED_NO_EVICT"
     STATIC_BATCH = "STATIC_BATCH"
 

@@ -230,7 +230,11 @@ enum class CapacitySchedulerPolicy
 
     /// @brief kSTATIC_BATCH does not schedule new requests until all requests in current batch are completed.
     /// Similar to kGUARANTEED_NO_EVICT, requests will run to completion without eviction.
-    kSTATIC_BATCH = 2
+    kSTATIC_BATCH = 2,
+
+    /// @brief TIER_AWARE_MAX_UTILIZATION keeps MAX_UTILIZATION packing behavior, but when it must pause a started
+    /// request it prefers lower priority tiers first and then the lowest fairness score within that tier.
+    kTIER_AWARE_MAX_UTILIZATION = 3
 };
 
 std::ostream& operator<<(std::ostream& os, CapacitySchedulerPolicy policy);

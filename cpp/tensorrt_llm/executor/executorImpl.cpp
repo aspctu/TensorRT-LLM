@@ -402,8 +402,9 @@ void Executor::Impl::initialize(::tensorrt_llm::executor::ExecutorConfig const& 
     TLLM_CHECK_WITH_INFO(mDebugTensorsMaxIterations == 0 || mCommMode == CommunicationMode::kLEADER,
         "debugTensorsMaxIterations > 0 is only allowed in leader mode.");
     mBatchingType = executorConfig.getBatchingType();
-    mIsSchedulerMaxUtilization = (executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy()
-        == CapacitySchedulerPolicy::kMAX_UTILIZATION);
+    auto const capacitySchedulerPolicy = executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy();
+    mIsSchedulerMaxUtilization = (capacitySchedulerPolicy == CapacitySchedulerPolicy::kMAX_UTILIZATION
+        || capacitySchedulerPolicy == CapacitySchedulerPolicy::kTIER_AWARE_MAX_UTILIZATION);
     mIsSchedulerGuaranteedNoEvict = (executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy()
         == CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT);
     mIsChunkedContext = executorConfig.getEnableChunkedContext();

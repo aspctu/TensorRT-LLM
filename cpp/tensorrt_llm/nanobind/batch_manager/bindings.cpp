@@ -147,6 +147,14 @@ void initBindings(nb::module_& m)
         .def("get_return_encoder_output", &GenLlmReq::getReturnEncoderOutput)
         .def("priority", nb::overload_cast<>(&GenLlmReq::priority, nb::const_))
         .def("set_priority", nb::overload_cast<tle::PriorityType>(&GenLlmReq::setPriority))
+        .def_prop_rw("scheduler_organization_hash", &GenLlmReq::getSchedulerOrganizationHash,
+            &GenLlmReq::setSchedulerOrganizationHash)
+        .def_prop_rw(
+            "scheduler_controls_enabled", &GenLlmReq::getSchedulerControlsEnabled, &GenLlmReq::setSchedulerControlsEnabled)
+        .def_prop_rw("scheduler_credit", &GenLlmReq::getSchedulerCredit, &GenLlmReq::setSchedulerCredit)
+        .def_prop_rw("scheduler_pause_count", &GenLlmReq::getSchedulerPauseCount, &GenLlmReq::setSchedulerPauseCount)
+        .def_prop_rw("scheduler_score", &GenLlmReq::getSchedulerScore, &GenLlmReq::setSchedulerScore)
+        .def_prop_rw("scheduler_age_credit", &GenLlmReq::getSchedulerAgeCredit, &GenLlmReq::setSchedulerAgeCredit)
         .def_prop_ro("cum_log_probs", &GenLlmReq::getCumLogProbs)
         .def("set_cum_log_prob", &GenLlmReq::setCumLogProb, nb::arg("cum_log_prob"), nb::arg("beam"))
         .def("update_num_tokens_per_iteration", &GenLlmReq::updateNumTokensPerIteration,

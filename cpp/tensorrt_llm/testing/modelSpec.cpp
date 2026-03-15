@@ -93,6 +93,11 @@ std::string ModelSpec::getCapacitySchedulerString() const
             return "MaxUtilization";
         }
         else if (mCapacitySchedulerPolicy.value()
+            == tensorrt_llm::executor::CapacitySchedulerPolicy::kTIER_AWARE_MAX_UTILIZATION)
+        {
+            return "TierAwareMaxUtilization";
+        }
+        else if (mCapacitySchedulerPolicy.value()
             == tensorrt_llm::executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
         {
             return "GuaranteedNoEvict";

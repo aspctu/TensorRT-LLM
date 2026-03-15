@@ -22,6 +22,15 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <numeric>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 namespace tensorrt_llm::batch_manager
 {
 using kv_cache_manager::VecUniqueTokens;
@@ -121,6 +130,566 @@ bool beneficialToSkip(std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest> c
     }
     return false;
 }
+
+using OrgFairnessStates = std::unordered_map<std::uint64_t, double>;
+
+struct RequestFairnessScore
+{
+    double total;
+    double ageCredit;
+    double orgTokenBalance;
+};
+
+constexpr double kSchedulerBasePriorityWeight = 1024.0;
+constexpr double kSchedulerMaxCredit = 8.0;
+constexpr double kSchedulerWaitCredit = 0.75;
+constexpr double kSchedulerPauseBonus = 1.5;
+constexpr double kSchedulerPauseProtection = 0.25;
+constexpr double kSchedulerServiceCost = 0.75;
+
+constexpr double kOrgTokenBalanceDecay = 0.85;
+constexpr double kOrgTokenBalanceMin = -256.0;
+constexpr double kOrgTokenScoreScale = 16.0;
+constexpr double kAdmissionPromptTokenCostDivisor = 128.0;
+constexpr double kAdmissionMaxNewTokenCostWeight = 0.25;
+constexpr double kAdmissionMaxCharge = 96.0;
+constexpr double kOrgActivePressureScale = 48.0;
+constexpr double kOrgActivePressurePenaltyScale = 8.0;
+
+[[nodiscard]] bool isSchedulableRequest(
+    std::shared_ptr<LlmRequest> const& req, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+{
+    if (req->isDisaggGenerationInitState())
+    {
+        return true;
+    }
+    return req->hasReachedState(noScheduleUntilState) && !req->hasReachedState(noScheduleAfterState);
+}
+
+[[nodiscard]] bool hasSchedulerControlsEnabled(RequestList const& activeRequests)
+{
+    return std::any_of(activeRequests.begin(), activeRequests.end(),
+        [](std::shared_ptr<LlmRequest> const& req) { return req->getSchedulerControlsEnabled(); });
+}
+
+[[nodiscard]] std::uint32_t getSchedulerTier(LlmRequest const& req)
+{
+    auto const priority = static_cast<double>(req.priority());
+    return static_cast<std::uint32_t>(std::max(0.0, std::floor(priority)));
+}
+
+[[nodiscard]] std::uint64_t getOrgFairnessKey(LlmRequest const& req)
+{
+    auto const tier = static_cast<std::uint64_t>(getSchedulerTier(req));
+    auto const organizationHash = req.getSchedulerOrganizationHash();
+    return organizationHash ^ (tier + 0x9e3779b97f4a7c15ULL + (organizationHash << 6) + (organizationHash >> 2));
+}
+
+[[nodiscard]] std::unordered_map<std::uint32_t, SizeType32> allocateReservedTierSlots(
+    std::vector<std::uint32_t> const& orderedTiers, SizeType32 totalSlots)
+{
+    if (totalSlots <= 0 || orderedTiers.empty())
+    {
+        return {};
+    }
+
+    std::unordered_map<std::uint32_t, SizeType32> reservedSlots;
+    reservedSlots.reserve(orderedTiers.size());
+    auto remainingSlots = totalSlots;
+    auto remainingTiers = static_cast<SizeType32>(orderedTiers.size());
+    for (auto const tier : orderedTiers)
+    {
+        if (remainingSlots <= 0)
+        {
+            reservedSlots.emplace(tier, 0);
+        }
+        else if (remainingTiers == 1)
+        {
+            reservedSlots.emplace(tier, remainingSlots);
+        }
+        else
+        {
+            reservedSlots.emplace(tier, std::max<SizeType32>(1, remainingSlots - (remainingTiers - 1)));
+        }
+
+        remainingSlots -= reservedSlots.at(tier);
+        --remainingTiers;
+    }
+
+    return reservedSlots;
+}
+
+[[nodiscard]] double estimateScheduledTokens(LlmRequest const& req)
+{
+    if (req.isEncoderInitState())
+    {
+        return static_cast<double>(std::max<SizeType32>(1, req.getEncoderOutputLen()));
+    }
+
+    if (req.isContextInitState() || req.isDisaggGenerationInitState())
+    {
+        auto chunkSize = req.getContextChunkSize();
+        if (chunkSize <= 0)
+        {
+            chunkSize = req.getNumTokens(0);
+        }
+
+        auto const draftTokens = (req.isLastContextChunk() && req.getNumDraftTokens() > 0) ? req.getNumDraftTokens() : 0;
+        return static_cast<double>(std::max<SizeType32>(1, chunkSize + draftTokens));
+    }
+
+    return static_cast<double>(std::max<SizeType32>(1, 1 + req.getNumDraftTokens()));
+}
+
+[[nodiscard]] double estimateActivationCharge(LlmRequest const& req)
+{
+    auto const promptCost = static_cast<double>(req.getOrigPromptLen()) / kAdmissionPromptTokenCostDivisor;
+    auto const decodeCost = static_cast<double>(req.getMaxNewTokens()) * kAdmissionMaxNewTokenCostWeight;
+    return std::min(kAdmissionMaxCharge, promptCost + decodeCost);
+}
+
+[[nodiscard]] double estimateOrgPressure(LlmRequest const& req)
+{
+    return 1.0 + (estimateActivationCharge(req) / kOrgActivePressureScale);
+}
+
+void updateOrgFairnessStates(OrgFairnessStates& orgFairnessStates, RequestList const& activeRequests,
+    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+{
+    for (auto& [orgKey, tokenBalance] : orgFairnessStates)
+    {
+        tokenBalance = std::max(kOrgTokenBalanceMin, tokenBalance * kOrgTokenBalanceDecay);
+    }
+
+    for (auto const& req : activeRequests)
+    {
+        if (!isSchedulableRequest(req, noScheduleUntilState, noScheduleAfterState))
+        {
+            continue;
+        }
+        auto const orgKey = getOrgFairnessKey(*req);
+        if (orgFairnessStates.find(orgKey) == orgFairnessStates.end())
+        {
+            orgFairnessStates.emplace(orgKey, 0.0);
+        }
+    }
+}
+
+[[nodiscard]] RequestFairnessScore evaluateFairnessScore(
+    std::shared_ptr<LlmRequest> const& req, OrgFairnessStates const& orgFairnessStates)
+{
+    double orgTokenBalance = 0.0;
+    if (auto const it = orgFairnessStates.find(getOrgFairnessKey(*req)); it != orgFairnessStates.end())
+    {
+        orgTokenBalance = it->second;
+    }
+
+    auto const ageCredit = req->getSchedulerCredit();
+    auto const total = req->priority() * kSchedulerBasePriorityWeight + ageCredit
+        + static_cast<double>(req->getSchedulerPauseCount()) * kSchedulerPauseProtection
+        + (orgTokenBalance / kOrgTokenScoreScale);
+    return RequestFairnessScore{total, ageCredit, orgTokenBalance};
+}
+
+void assignFairnessMetrics(std::shared_ptr<LlmRequest> const& req, RequestFairnessScore const& score)
+{
+    req->setSchedulerScore(score.total);
+    req->setSchedulerAgeCredit(score.ageCredit);
+}
+
+[[nodiscard]] double getVictimScore(std::shared_ptr<LlmRequest> const& req)
+{
+    if (req->getSchedulerControlsEnabled())
+    {
+        return req->getSchedulerScore();
+    }
+    return req->priority();
+}
+
+void sortActiveRequestsByFairness(RequestList& activeRequests, OrgFairnessStates const& orgFairnessStates,
+    SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+{
+    std::unordered_map<LlmRequest::RequestIdType, RequestFairnessScore> requestScores;
+    requestScores.reserve(activeRequests.size());
+    std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<LlmRequest>>> requestsByOrg;
+    requestsByOrg.reserve(activeRequests.size());
+    for (auto const& req : activeRequests)
+    {
+        auto const score = evaluateFairnessScore(req, orgFairnessStates);
+        assignFairnessMetrics(req, score);
+        if (!isSchedulableRequest(req, noScheduleUntilState, noScheduleAfterState))
+        {
+            continue;
+        }
+
+        requestScores.emplace(req->mRequestId, score);
+        requestsByOrg[getOrgFairnessKey(*req)].emplace_back(req);
+    }
+
+    struct OrganizationQueue
+    {
+        std::uint32_t tier;
+        std::uint64_t orgKey;
+        double orgTokenBalance;
+        double orgPressure;
+        std::vector<std::shared_ptr<LlmRequest>> requests;
+        std::size_t nextRequestIndex{0};
+        double emittedPressure{0.0};
+        double emittedActivationDebt{0.0};
+    };
+
+    std::unordered_map<std::uint32_t, std::vector<OrganizationQueue>> organizationQueuesByTier;
+    organizationQueuesByTier.reserve(requestsByOrg.size());
+    for (auto& [orgKey, orgRequests] : requestsByOrg)
+    {
+        std::stable_sort(orgRequests.begin(), orgRequests.end(),
+            [&requestScores](std::shared_ptr<LlmRequest> const& lhs, std::shared_ptr<LlmRequest> const& rhs)
+            {
+                return requestScores.at(lhs->mRequestId).total > requestScores.at(rhs->mRequestId).total;
+            });
+
+        auto const orgStateIt = orgFairnessStates.find(orgKey);
+        auto const orgTokenBalance = orgStateIt != orgFairnessStates.end() ? orgStateIt->second : 0.0;
+        auto const tier = getSchedulerTier(*orgRequests.front());
+        auto const orgPressure = std::accumulate(orgRequests.begin(), orgRequests.end(), 0.0,
+            [](double pressure, std::shared_ptr<LlmRequest> const& req)
+            { return pressure + estimateOrgPressure(*req); });
+        auto organizationQueue = OrganizationQueue{};
+        organizationQueue.tier = tier;
+        organizationQueue.orgKey = orgKey;
+        organizationQueue.orgTokenBalance = orgTokenBalance;
+        organizationQueue.orgPressure = orgPressure;
+        organizationQueue.requests = std::move(orgRequests);
+        organizationQueuesByTier[tier].emplace_back(std::move(organizationQueue));
+    }
+
+    std::vector<std::uint32_t> orderedTiers;
+    orderedTiers.reserve(organizationQueuesByTier.size());
+    for (auto const& [tier, _organizationQueues] : organizationQueuesByTier)
+    {
+        orderedTiers.emplace_back(tier);
+    }
+    std::sort(orderedTiers.begin(), orderedTiers.end(), std::greater<>());
+
+    auto const quotaWindow = std::min<SizeType32>(maxNumRequests, requestScores.size());
+    auto const quotasByTier = allocateReservedTierSlots(orderedTiers, quotaWindow);
+
+    std::unordered_map<std::uint32_t, std::vector<std::shared_ptr<LlmRequest>>> orderedRequestsByTier;
+    orderedRequestsByTier.reserve(orderedTiers.size());
+    for (auto const tier : orderedTiers)
+    {
+        auto& organizationQueues = organizationQueuesByTier[tier];
+        auto const tierFairPressureShare = std::accumulate(organizationQueues.begin(), organizationQueues.end(), 0.0,
+            [](double totalPressure, OrganizationQueue const& queue) { return totalPressure + queue.orgPressure; })
+            / static_cast<double>(organizationQueues.size());
+        std::stable_sort(organizationQueues.begin(), organizationQueues.end(),
+            [&requestScores, tierFairPressureShare](OrganizationQueue const& lhs, OrganizationQueue const& rhs)
+            {
+                auto const lhsTopReq = lhs.requests.front();
+                auto const rhsTopReq = rhs.requests.front();
+                auto const lhsTopScore = requestScores.at(lhsTopReq->mRequestId).total;
+                auto const rhsTopScore = requestScores.at(rhsTopReq->mRequestId).total;
+                auto const lhsPressureExcess = std::max(0.0, lhs.orgPressure - tierFairPressureShare);
+                auto const rhsPressureExcess = std::max(0.0, rhs.orgPressure - tierFairPressureShare);
+                auto const lhsSelectionScore = lhsTopScore - (lhsPressureExcess * kOrgActivePressurePenaltyScale);
+                auto const rhsSelectionScore = rhsTopScore - (rhsPressureExcess * kOrgActivePressurePenaltyScale);
+                if (lhsSelectionScore != rhsSelectionScore)
+                {
+                    return lhsSelectionScore > rhsSelectionScore;
+                }
+
+                if (lhsPressureExcess != rhsPressureExcess)
+                {
+                    return lhsPressureExcess < rhsPressureExcess;
+                }
+
+                if (lhs.orgPressure != rhs.orgPressure)
+                {
+                    return lhs.orgPressure < rhs.orgPressure;
+                }
+
+                if (lhs.orgTokenBalance != rhs.orgTokenBalance)
+                {
+                    return lhs.orgTokenBalance > rhs.orgTokenBalance;
+                }
+
+                return lhsTopReq->mRequestId < rhsTopReq->mRequestId;
+            });
+
+        auto& orderedTierRequests = orderedRequestsByTier[tier];
+        auto const breadthLimit = std::min<std::size_t>(
+            static_cast<std::size_t>(quotasByTier.at(tier)), organizationQueues.size());
+        while (true)
+        {
+            if (orderedTierRequests.size() >= breadthLimit)
+            {
+                break;
+            }
+            double tierFairPressureShare = 0.0;
+            SizeType32 activeOrganizationCount = 0;
+            for (auto const& queue : organizationQueues)
+            {
+                if (queue.nextRequestIndex >= queue.requests.size())
+                {
+                    continue;
+                }
+                tierFairPressureShare += queue.orgPressure + queue.emittedPressure;
+                ++activeOrganizationCount;
+            }
+            if (activeOrganizationCount == 0)
+            {
+                break;
+            }
+            tierFairPressureShare /= static_cast<double>(activeOrganizationCount);
+
+            auto bestQueueIt = organizationQueues.end();
+            for (auto queueIt = organizationQueues.begin(); queueIt != organizationQueues.end(); ++queueIt)
+            {
+                if (queueIt->nextRequestIndex >= queueIt->requests.size())
+                {
+                    continue;
+                }
+
+                if (bestQueueIt == organizationQueues.end())
+                {
+                    bestQueueIt = queueIt;
+                    continue;
+                }
+
+                auto const& lhsTopReq = queueIt->requests[queueIt->nextRequestIndex];
+                auto const& rhsTopReq = bestQueueIt->requests[bestQueueIt->nextRequestIndex];
+                auto const lhsPressure = queueIt->orgPressure + queueIt->emittedPressure;
+                auto const rhsPressure = bestQueueIt->orgPressure + bestQueueIt->emittedPressure;
+                auto const lhsPressureExcess = std::max(0.0, lhsPressure - tierFairPressureShare);
+                auto const rhsPressureExcess = std::max(0.0, rhsPressure - tierFairPressureShare);
+                auto const lhsAdjustedScore = requestScores.at(lhsTopReq->mRequestId).total
+                    - (queueIt->emittedActivationDebt / kOrgTokenScoreScale)
+                    - (lhsPressureExcess * kOrgActivePressurePenaltyScale);
+                auto const rhsAdjustedScore = requestScores.at(rhsTopReq->mRequestId).total
+                    - (bestQueueIt->emittedActivationDebt / kOrgTokenScoreScale)
+                    - (rhsPressureExcess * kOrgActivePressurePenaltyScale);
+
+                if (lhsAdjustedScore != rhsAdjustedScore)
+                {
+                    if (lhsAdjustedScore > rhsAdjustedScore)
+                    {
+                        bestQueueIt = queueIt;
+                    }
+                    continue;
+                }
+
+                if (lhsPressureExcess != rhsPressureExcess)
+                {
+                    if (lhsPressureExcess < rhsPressureExcess)
+                    {
+                        bestQueueIt = queueIt;
+                    }
+                    continue;
+                }
+
+                if (lhsPressure != rhsPressure)
+                {
+                    if (lhsPressure < rhsPressure)
+                    {
+                        bestQueueIt = queueIt;
+                    }
+                    continue;
+                }
+
+                if (lhsTopReq->mRequestId < rhsTopReq->mRequestId)
+                {
+                    bestQueueIt = queueIt;
+                }
+            }
+
+            if (bestQueueIt == organizationQueues.end())
+            {
+                break;
+            }
+
+            auto const& nextReq = bestQueueIt->requests[bestQueueIt->nextRequestIndex];
+            orderedTierRequests.emplace_back(nextReq);
+            bestQueueIt->emittedPressure += estimateOrgPressure(*nextReq);
+            bestQueueIt->emittedActivationDebt += estimateActivationCharge(*nextReq);
+            ++bestQueueIt->nextRequestIndex;
+        }
+
+        std::vector<std::shared_ptr<LlmRequest>> remainingTierRequests;
+        for (auto const& queue : organizationQueues)
+        {
+            for (auto requestIndex = queue.nextRequestIndex; requestIndex < queue.requests.size(); ++requestIndex)
+            {
+                remainingTierRequests.emplace_back(queue.requests[requestIndex]);
+            }
+        }
+        std::stable_sort(remainingTierRequests.begin(), remainingTierRequests.end(),
+            [&requestScores](std::shared_ptr<LlmRequest> const& lhs, std::shared_ptr<LlmRequest> const& rhs)
+            {
+                auto const lhsScore = requestScores.at(lhs->mRequestId).total;
+                auto const rhsScore = requestScores.at(rhs->mRequestId).total;
+                if (lhsScore != rhsScore)
+                {
+                    return lhsScore > rhsScore;
+                }
+                return lhs->mRequestId < rhs->mRequestId;
+            });
+        orderedTierRequests.insert(
+            orderedTierRequests.end(), remainingTierRequests.begin(), remainingTierRequests.end());
+    }
+
+    std::vector<std::shared_ptr<LlmRequest>> schedulableRequests;
+    schedulableRequests.reserve(requestScores.size());
+
+    for (auto const tier : orderedTiers)
+    {
+        auto& orderedTierRequests = orderedRequestsByTier[tier];
+        auto const quota = std::min<SizeType32>(quotasByTier.at(tier), orderedTierRequests.size());
+        for (SizeType32 index = 0; index < quota; ++index)
+        {
+            schedulableRequests.emplace_back(orderedTierRequests.front());
+            orderedTierRequests.erase(orderedTierRequests.begin());
+        }
+    }
+
+    auto const quotaWindowSize = static_cast<std::size_t>(quotaWindow);
+    while (schedulableRequests.size() < quotaWindowSize)
+    {
+        bool addedRequest = false;
+        for (auto const tier : orderedTiers)
+        {
+            auto& orderedTierRequests = orderedRequestsByTier[tier];
+            if (orderedTierRequests.empty())
+            {
+                continue;
+            }
+
+            schedulableRequests.emplace_back(orderedTierRequests.front());
+            orderedTierRequests.erase(orderedTierRequests.begin());
+            addedRequest = true;
+            if (schedulableRequests.size() >= quotaWindowSize)
+            {
+                break;
+            }
+        }
+        if (!addedRequest)
+        {
+            break;
+        }
+    }
+
+    while (schedulableRequests.size() < requestScores.size())
+    {
+        bool addedRequest = false;
+        for (auto const tier : orderedTiers)
+        {
+            auto& orderedTierRequests = orderedRequestsByTier[tier];
+            if (orderedTierRequests.empty())
+            {
+                continue;
+            }
+
+            schedulableRequests.emplace_back(orderedTierRequests.front());
+            orderedTierRequests.erase(orderedTierRequests.begin());
+            addedRequest = true;
+        }
+        if (!addedRequest)
+        {
+            break;
+        }
+    }
+
+    auto schedulableReqIt = schedulableRequests.begin();
+    for (auto& req : activeRequests)
+    {
+        if (!isSchedulableRequest(req, noScheduleUntilState, noScheduleAfterState))
+        {
+            continue;
+        }
+
+        req = *schedulableReqIt;
+        ++schedulableReqIt;
+    }
+}
+
+void updateRequestFairnessState(RequestList const& activeRequests, RequestVector const& scheduledRequests,
+    RequestVector const& pausedRequests, OrgFairnessStates& orgFairnessStates, LlmRequestState noScheduleUntilState,
+    LlmRequestState noScheduleAfterState)
+{
+    std::unordered_set<LlmRequest::RequestIdType> scheduledRequestIds;
+    scheduledRequestIds.reserve(scheduledRequests.size());
+    std::unordered_map<std::uint64_t, double> scheduledTokensByOrg;
+    std::unordered_map<std::uint32_t, double> scheduledTokensByTier;
+    for (auto const& req : scheduledRequests)
+    {
+        scheduledRequestIds.insert(req->mRequestId);
+        auto const scheduledTokens = estimateScheduledTokens(*req);
+        scheduledTokensByOrg[getOrgFairnessKey(*req)] += scheduledTokens;
+        scheduledTokensByTier[getSchedulerTier(*req)] += scheduledTokens;
+    }
+
+    std::unordered_set<LlmRequest::RequestIdType> pausedRequestIds;
+    pausedRequestIds.reserve(pausedRequests.size());
+    for (auto const& req : pausedRequests)
+    {
+        pausedRequestIds.insert(req->mRequestId);
+    }
+
+    std::unordered_map<std::uint32_t, std::unordered_set<std::uint64_t>> activeOrgKeysByTier;
+
+    for (auto const& req : activeRequests)
+    {
+        if (!isSchedulableRequest(req, noScheduleUntilState, noScheduleAfterState))
+        {
+            continue;
+        }
+
+        activeOrgKeysByTier[getSchedulerTier(*req)].insert(getOrgFairnessKey(*req));
+
+        auto credit = req->getSchedulerCredit();
+        auto pauseCount = req->getSchedulerPauseCount();
+
+        if (pausedRequestIds.find(req->mRequestId) != pausedRequestIds.end())
+        {
+            req->setSchedulerPauseCount(pauseCount + 1);
+            req->setSchedulerCredit(std::min(kSchedulerMaxCredit, credit + kSchedulerWaitCredit + kSchedulerPauseBonus));
+            continue;
+        }
+
+        if (scheduledRequestIds.find(req->mRequestId) != scheduledRequestIds.end())
+        {
+            req->setSchedulerPauseCount(pauseCount > 0 ? pauseCount - 1 : 0);
+            req->setSchedulerCredit(std::max(0.0, credit - kSchedulerServiceCost));
+            continue;
+        }
+
+        req->setSchedulerCredit(std::min(kSchedulerMaxCredit, credit + kSchedulerWaitCredit));
+    }
+
+    for (auto const& [tier, orgKeys] : activeOrgKeysByTier)
+    {
+        if (orgKeys.empty())
+        {
+            continue;
+        }
+
+        auto const fairServiceGrant = scheduledTokensByTier[tier] / static_cast<double>(orgKeys.size());
+        if (fairServiceGrant <= 0.0)
+        {
+            continue;
+        }
+
+        for (auto const orgKey : orgKeys)
+        {
+            orgFairnessStates[orgKey] += fairServiceGrant;
+        }
+    }
+
+    for (auto const& [orgKey, scheduledTokens] : scheduledTokensByOrg)
+    {
+        auto& tokenBalance = orgFairnessStates[orgKey];
+        tokenBalance = std::max(kOrgTokenBalanceMin, tokenBalance - scheduledTokens);
+    }
+}
 } // namespace
 
 MaxRequestsScheduler::MaxRequestsScheduler(
@@ -130,11 +699,12 @@ MaxRequestsScheduler::MaxRequestsScheduler(
 {
 }
 
-MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
+MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead, bool tierAwareEviction,
     LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
     : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
     , mMaxNumRequests(maxNumRequests)
     , mTwoStepsLookAhead{twoStepsLookAhead}
+    , mTierAwareEviction{tierAwareEviction}
 {
 }
 
@@ -232,6 +802,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     RequestVector pendingDisGenInitRequests;
     pendingRequests.reserve(activeRequests.size());
     pendingDisGenInitRequests.reserve(activeRequests.size());
+    std::unordered_map<std::uint32_t, SizeType32> scheduledCountsByTier;
     for (auto const& req : activeRequests)
     {
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
@@ -251,6 +822,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         if (req->isGenerationInProgressState())
         {
             scheduledRequests.emplace_back(req);
+            ++scheduledCountsByTier[getSchedulerTier(*req)];
             reservedBlocks.decrementReservedBlocks(*req);
             if (reservedCrossBlocks)
                 reservedCrossBlocks->decrementReservedBlocks(*req);
@@ -278,6 +850,23 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     {
         // Now check if we can add pending requests
         auto availablePeftPages = maxPeftCachePages - claimedPeftPages;
+        std::unordered_map<std::uint32_t, SizeType32> pendingBacklogByTier;
+        for (auto const& req : pendingDisGenInitRequests)
+        {
+            ++pendingBacklogByTier[getSchedulerTier(*req)];
+        }
+        for (auto const& req : pendingRequests)
+        {
+            ++pendingBacklogByTier[getSchedulerTier(*req)];
+        }
+        std::vector<std::uint32_t> orderedPendingTiers;
+        orderedPendingTiers.reserve(pendingBacklogByTier.size());
+        for (auto const& [tier, _count] : pendingBacklogByTier)
+        {
+            orderedPendingTiers.emplace_back(tier);
+        }
+        std::sort(orderedPendingTiers.begin(), orderedPendingTiers.end(), std::greater<>());
+        auto const tierReservedSlots = allocateReservedTierSlots(orderedPendingTiers, mMaxNumRequests);
 
         // Loop over pending requests and add them if they can be scheduled
         // Start by trying to include disagg generation init requests
@@ -285,6 +874,30 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         {
             for (auto const& req : requests)
             {
+                auto const tier = getSchedulerTier(*req);
+                SizeType32 remainingReservedSlots{0};
+                for (auto const higherTier : orderedPendingTiers)
+                {
+                    if (higherTier <= tier)
+                    {
+                        continue;
+                    }
+
+                    auto const pendingBacklog = pendingBacklogByTier[higherTier];
+                    auto const scheduledCount = scheduledCountsByTier[higherTier];
+                    auto const reservedCount = tierReservedSlots.at(higherTier);
+                    if (pendingBacklog > 0 && scheduledCount < reservedCount)
+                    {
+                        remainingReservedSlots += reservedCount - scheduledCount;
+                    }
+                }
+                auto const futureScheduledCount = static_cast<SizeType32>(scheduledRequests.size() + 1);
+                if (remainingReservedSlots > 0
+                    && futureScheduledCount > (mMaxNumRequests - remainingReservedSlots))
+                {
+                    continue;
+                }
+
                 // if context request can reuse blocks contributed by another context request, skip
                 if (!StaticBatchScheduling && skippingIsRelevant && !req->isDisaggGenerationInitState()
                     && beneficialToSkip(req, kvCacheManager, crossKvCacheManager, newlyContributedContextBlocks,
@@ -310,6 +923,8 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     if (enoughBlocks && enoughCrossBlocks && neededPeftPages <= availablePeftPages)
                     {
                         scheduledRequests.emplace_back(req);
+                        ++scheduledCountsByTier[tier];
+                        pendingBacklogByTier[tier] = std::max<SizeType32>(0, pendingBacklogByTier[tier] - 1);
                         reservedBlocks.decrementReservedBlocks(*req);
                         if (reservedCrossBlocks)
                             reservedCrossBlocks->decrementReservedBlocks(*req);
@@ -401,18 +1016,57 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         }
         else
         {
-            auto const rbegin = std::reverse_iterator(reqItEnd);
-            auto const rend = std::reverse_iterator(reqIt);
-            auto const lastStartedReqIt = std::find_if(rbegin, rend, startedReqLambda);
-            if (lastStartedReqIt != rend)
+            auto pauseVictimIt = reqItEnd;
+            if (!mTierAwareEviction)
             {
-                // If we can't allocate a started request, we need to start freeing started requests
-                // from the end of the vector and try again
-                // Here we simulate freeing the kvCache blocks associated with that sequence
-                kvCacheManager.schedulingRemoveSequence((*lastStartedReqIt)->mRequestId);
-                pausedRequests.emplace_back(*lastStartedReqIt);
-                TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
-                reqItEnd = std::next(lastStartedReqIt).base();
+                auto const rbegin = std::reverse_iterator(reqItEnd);
+                auto const rend = std::reverse_iterator(reqIt);
+                auto const lastStartedReqIt = std::find_if(rbegin, rend, startedReqLambda);
+                if (lastStartedReqIt != rend)
+                {
+                    pauseVictimIt = std::prev(lastStartedReqIt.base());
+                }
+            }
+            else
+            {
+                auto const currentTier = getSchedulerTier(*req);
+                bool foundVictim = false;
+                std::uint32_t victimTier = 0;
+                double victimScore = 0.0;
+                for (auto candidateIt = reqIt; candidateIt != reqItEnd; ++candidateIt)
+                {
+                    auto const& candidate = *candidateIt;
+                    if (!startedReqLambda(candidate))
+                    {
+                        continue;
+                    }
+
+                    auto const candidateTier = getSchedulerTier(*candidate);
+                    if (candidateTier > currentTier)
+                    {
+                        continue;
+                    }
+
+                    auto const candidateScore = getVictimScore(candidate);
+                    if (!foundVictim || candidateTier < victimTier
+                        || (candidateTier == victimTier && candidateScore < victimScore)
+                        || (candidateTier == victimTier && candidateScore == victimScore))
+                    {
+                        pauseVictimIt = candidateIt;
+                        victimTier = candidateTier;
+                        victimScore = candidateScore;
+                        foundVictim = true;
+                    }
+                }
+            }
+
+            if (pauseVictimIt != reqItEnd)
+            {
+                // If we can't allocate a request, free a started request and retry.
+                kvCacheManager.schedulingRemoveSequence((*pauseVictimIt)->mRequestId);
+                pausedRequests.emplace_back(*pauseVictimIt);
+                TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> pause", (*pauseVictimIt)->mRequestId);
+                reqItEnd = pauseVictimIt;
             }
             else
             {
@@ -461,6 +1115,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
 CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     executor::CapacitySchedulerPolicy capacitySchedulerPolicy, bool hasKvCacheManager, bool twoStepsLookAhead,
     LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+    : mMaxNumRequests(maxNumRequests)
 {
     if (!hasKvCacheManager)
     {
@@ -469,7 +1124,14 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kMAX_UTILIZATION)
     {
         mScheduler
-            = MaxUtilizationScheduler{maxNumRequests, twoStepsLookAhead, noScheduleUntilState, noScheduleAfterState};
+            = MaxUtilizationScheduler{
+                maxNumRequests, twoStepsLookAhead, false, noScheduleUntilState, noScheduleAfterState};
+    }
+    else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kTIER_AWARE_MAX_UTILIZATION)
+    {
+        mScheduler
+            = MaxUtilizationScheduler{
+                maxNumRequests, twoStepsLookAhead, true, noScheduleUntilState, noScheduleAfterState};
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
     {
@@ -492,25 +1154,67 @@ std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::opera
 {
     NVTX3_SCOPED_RANGE(capacitySchedulerScheduling);
     return std::visit(
-        [&activeRequests, &kvCacheManager, &crossKvCacheManager, &peftCacheManager](
+        [this, &activeRequests, &kvCacheManager, &crossKvCacheManager, &peftCacheManager](
             auto const& scheduler) -> std::tuple<RequestVector, RequestVector, RequestVector>
         {
             RequestVector tmpFittingRequests;
             RequestVector pausedRequests;
+            RequestList orderedActiveRequests(activeRequests.begin(), activeRequests.end());
+            auto const fairnessEnabled = hasSchedulerControlsEnabled(orderedActiveRequests);
+
             if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, MaxRequestsScheduler>)
             {
-                std::tie(tmpFittingRequests, pausedRequests) = scheduler(activeRequests);
+                if (fairnessEnabled)
+                {
+                    updateOrgFairnessStates(mSchedulerOrgFairnessStates, orderedActiveRequests,
+                        scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                    sortActiveRequestsByFairness(orderedActiveRequests, mSchedulerOrgFairnessStates,
+                        mMaxNumRequests, scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                }
+                std::tie(tmpFittingRequests, pausedRequests) = scheduler(orderedActiveRequests);
+                if (fairnessEnabled)
+                {
+                    updateRequestFairnessState(orderedActiveRequests, tmpFittingRequests, pausedRequests,
+                        mSchedulerOrgFairnessStates,
+                        scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                }
             }
             else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, MaxUtilizationScheduler>)
             {
+                if (fairnessEnabled)
+                {
+                    updateOrgFairnessStates(mSchedulerOrgFairnessStates, orderedActiveRequests,
+                        scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                    sortActiveRequestsByFairness(orderedActiveRequests, mSchedulerOrgFairnessStates,
+                        mMaxNumRequests, scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                }
                 std::tie(tmpFittingRequests, pausedRequests)
-                    = scheduler(*kvCacheManager, peftCacheManager, activeRequests);
+                    = scheduler(*kvCacheManager, peftCacheManager, orderedActiveRequests);
+                if (fairnessEnabled)
+                {
+                    updateRequestFairnessState(orderedActiveRequests, tmpFittingRequests, pausedRequests,
+                        mSchedulerOrgFairnessStates,
+                        scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                }
             }
             else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, GuaranteedNoEvictScheduler>
                 || std::is_same_v<std::decay_t<decltype(scheduler)>, StaticBatchScheduler>)
             {
+                if (fairnessEnabled)
+                {
+                    updateOrgFairnessStates(mSchedulerOrgFairnessStates, orderedActiveRequests,
+                        scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                    sortActiveRequestsByFairness(orderedActiveRequests, mSchedulerOrgFairnessStates,
+                        mMaxNumRequests, scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                }
                 std::tie(tmpFittingRequests, pausedRequests)
-                    = scheduler(*kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
+                    = scheduler(*kvCacheManager, crossKvCacheManager, peftCacheManager, orderedActiveRequests);
+                if (fairnessEnabled)
+                {
+                    updateRequestFairnessState(orderedActiveRequests, tmpFittingRequests, pausedRequests,
+                        mSchedulerOrgFairnessStates,
+                        scheduler.getNoScheduleUntilState(), scheduler.getNoScheduleAfterState());
+                }
             }
             else
             {

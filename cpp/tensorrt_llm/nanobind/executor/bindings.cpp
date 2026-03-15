@@ -89,6 +89,7 @@ void initBindings(nb::module_& m)
 
     nb::enum_<tle::CapacitySchedulerPolicy>(m, "CapacitySchedulerPolicy")
         .value("MAX_UTILIZATION", tle::CapacitySchedulerPolicy::kMAX_UTILIZATION)
+        .value("TIER_AWARE_MAX_UTILIZATION", tle::CapacitySchedulerPolicy::kTIER_AWARE_MAX_UTILIZATION)
         .value("GUARANTEED_NO_EVICT", tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
         .value("STATIC_BATCH", tle::CapacitySchedulerPolicy::kSTATIC_BATCH);
 
