@@ -6,7 +6,6 @@ This module tests:
 
 """
 
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -18,8 +17,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     merge_helix_requests,
     merge_requests,
 )
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, create_waiting_queue
-from tensorrt_llm._torch.pyexecutor.scheduler_fairness import SchedulerFairnessController
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.scheduling_params import (
@@ -361,79 +359,6 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req2 in result
     assert req3 in result
     assert req1 not in result
-
-
-def test_get_from_waiting_queue_mitigates_noisy_neighbor_in_same_tier():
-    fairness = SchedulerFairnessController(time_fn=lambda: 0.0)
-    waiting_queue = create_waiting_queue(
-        priority_fn=fairness.score_waiting_request,
-    )
-
-    hot_waiting_0 = RequestQueueItem(
-        1,
-        SimpleNamespace(
-            py_scheduling_params=SchedulingParams(
-                priority_tier=2,
-                organization_id="org-hot",
-            )
-        ),
-    )
-    hot_waiting_1 = RequestQueueItem(
-        2,
-        SimpleNamespace(
-            py_scheduling_params=SchedulingParams(
-                priority_tier=2,
-                organization_id="org-hot",
-            )
-        ),
-    )
-    cool_waiting_0 = RequestQueueItem(
-        3,
-        SimpleNamespace(
-            py_scheduling_params=SchedulingParams(
-                priority_tier=2,
-                organization_id="org-cool",
-            )
-        ),
-    )
-    cool_waiting_1 = RequestQueueItem(
-        4,
-        SimpleNamespace(
-            py_scheduling_params=SchedulingParams(
-                priority_tier=2,
-                organization_id="org-cool",
-            )
-        ),
-    )
-    queued_requests = [
-        hot_waiting_0,
-        hot_waiting_1,
-        cool_waiting_0,
-        cool_waiting_1,
-    ]
-    waiting_queue.add_requests(queued_requests)
-    fairness.on_requests_enqueued(queued_requests)
-
-    active_requests = []
-    for request_id in (101, 102):
-        active_requests.append(
-            SimpleNamespace(
-                request_id=request_id,
-                py_priority_tier=2,
-                py_organization_id="org-hot",
-            )
-        )
-
-    result = get_from_waiting_queue(
-        waiting_queue,
-        4,
-        enable_attention_dp=False,
-        max_num_active_requests=8,
-        active_requests=active_requests,
-        scheduler_fairness=fairness,
-    )
-
-    assert [req_item.id for req_item in result] == [3, 4, 1, 2]
 
 
 def test_can_process_attention_dp_request(attention_dp_config):

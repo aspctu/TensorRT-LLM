@@ -60,12 +60,11 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
+from .request_metadata import (RequestStatsExtra, request_organization_id,
+                               request_organization_key,
+                               request_priority_tier)
 from .resource_manager import (ResourceManager, ResourceManagerType,
                                request_context)
-from .scheduler_fairness import (SchedulerFairnessController,
-                                 RequestStatsExtra,
-                                 request_organization_id,
-                                 request_priority_tier)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -98,10 +97,10 @@ def _priority_counts(requests: Iterable[object]) -> Dict[str, int]:
 
 def _organization_counts(requests: Iterable[object]) -> Dict[str, int]:
     from collections import Counter
-    counts = Counter(request_organization_id(request) for request in requests)
+    counts = Counter(request_organization_key(request) for request in requests)
     return {
-        organization_id: count
-        for organization_id, count in sorted(counts.items())
+        organization_key: count
+        for organization_key, count in sorted(counts.items())
     }
 
 
@@ -332,8 +331,6 @@ class PyExecutor:
         # related modules
         self.resource_manager = resource_manager
         self.scheduler = scheduler
-        self.scheduler_fairness: Optional[SchedulerFairnessController] = getattr(
-            scheduler, "fairness_controller", None)
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
@@ -516,10 +513,7 @@ class PyExecutor:
                                                       self.hang_detector)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
-        self.waiting_queue: WaitingQueue = create_waiting_queue(
-            waiting_queue_policy,
-            priority_fn=self.scheduler_fairness.score_waiting_request
-            if self.scheduler_fairness is not None else None)
+        self.waiting_queue: WaitingQueue = create_waiting_queue(waiting_queue_policy)
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -1102,21 +1096,11 @@ class PyExecutor:
                 int, float]]]:
         queued_requests, waiting_requests = self._collect_waiting_and_queued_requests()
 
-        if self.scheduler_fairness is None:
-            return {
-                "active": _organization_counts(active_requests),
-                "queued": _organization_counts(queued_requests),
-                "waiting": _organization_counts(waiting_requests),
-            }
-
-        return self.scheduler_fairness.build_organization_stats(
-            active_requests=active_requests,
-            queued_requests=queued_requests,
-            waiting_requests=waiting_requests,
-            scheduled_context_requests=scheduled_batch.context_requests,
-            scheduled_generation_requests=scheduled_batch.generation_requests,
-            paused_requests=scheduled_batch.paused_requests,
-        )
+        return {
+            "active": _organization_counts(active_requests),
+            "queued": _organization_counts(queued_requests),
+            "waiting": _organization_counts(waiting_requests),
+        }
 
     def _build_tier_stats(
         self,
@@ -2580,9 +2564,6 @@ class PyExecutor:
                                    > 1) and self.dist.rank > 0:
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
-        if self.scheduler_fairness is not None:
-            self.scheduler_fairness.on_requests_enqueued(new_requests)
-
         waiting_queue.add_requests(new_requests)
 
     def _pop_from_waiting_queue(
@@ -2605,10 +2586,7 @@ class PyExecutor:
             max_new_requests,
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
-            max_service_requests=self.max_batch_size,
-            all_ranks_num_active_requests=all_ranks_num_active_requests,
-            active_requests=active_requests,
-            scheduler_fairness=self.scheduler_fairness)
+            all_ranks_num_active_requests=all_ranks_num_active_requests)
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -2729,9 +2707,6 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
-        if self.scheduler_fairness is not None:
-            self.scheduler_fairness.on_requests_activated(validated_requests)
-
         self.active_requests.extend(validated_requests)
         return validated_requests
 
@@ -2843,12 +2818,6 @@ class PyExecutor:
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
-
-        if self.scheduler_fairness is not None:
-            self.scheduler_fairness.on_requests_scheduled(
-                scheduled_requests.context_requests,
-                scheduled_requests.generation_requests,
-            )
 
         self.tier_runtime_stats.mark_requests_scheduled(
             scheduled_requests.context_requests,

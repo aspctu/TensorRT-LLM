@@ -192,19 +192,11 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                     f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues."
                 )
 
-    skip_requirements = (
-        no_venv and os.environ.get("TRTLLM_BUILD_SKIP_REQUIREMENTS") == "1")
-    if skip_requirements:
-        print(
-            f"-- Skipping requirements install for {venv_prefix}; "
-            "reusing the existing environment as requested.")
-    else:
-        # `--no-venv` is often used inside the NGC devel container, where the
-        # required build dependencies are already preinstalled system-wide.
-        print(
-            f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
-        )
-        build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
+    # Install/update requirements
+    print(
+        f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
+    )
+    build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
     venv_conan = setup_conan(scripts_dir, venv_python)
 
@@ -212,10 +204,11 @@ def setup_venv(project_dir: Path, requirements_file: Path,
 
 
 def setup_conan(scripts_dir, venv_python):
-    # Determine the path to the conan executable within the venv, or fall back
-    # to a matching system install before attempting a pip reinstall.
+    build_run(f'"{venv_python}" -m pip install conan==2.14.0')
+    # Determine the path to the conan executable within the venv
     venv_conan = scripts_dir / "conan"
     if not venv_conan.exists():
+        # Attempt to find it using shutil.which as a fallback, in case it's already installed in the system
         try:
             result = build_run(
                 f'''{venv_python} -c "import shutil; print(shutil.which('conan'))" ''',
@@ -223,42 +216,25 @@ def setup_conan(scripts_dir, venv_python):
                 text=True)
             conan_path_str = result.stdout.strip()
 
-            if conan_path_str:
+            if conan_path_str and conan_path_str != "None":
                 venv_conan = Path(conan_path_str)
                 print(
                     f"-- Found conan executable via PATH search at: {venv_conan}"
                 )
             else:
-                venv_conan = None
+                raise RuntimeError(
+                    f"Failed to locate conan executable in virtual environment {scripts_dir} or system PATH."
+                )
 
         except CalledProcessError as e:
             print(f"Fallback search command output: {e.stdout}",
                   file=sys.stderr)
             print(f"Fallback search command error: {e.stderr}", file=sys.stderr)
-            venv_conan = None
+            raise RuntimeError(
+                f"Failed to locate conan executable in virtual environment {scripts_dir} or system PATH."
+            )
     else:
         print(f"-- Found conan executable at: {venv_conan}")
-
-    if venv_conan is not None:
-        version_result = build_run(f'"{venv_conan}" --version',
-                                   capture_output=True,
-                                   text=True)
-        version_output = version_result.stdout.strip()
-        if "Conan version 2.14.0" in version_output:
-            print(f"-- Reusing existing Conan install: {version_output}")
-        else:
-            print(
-                f"-- Existing Conan install is not 2.14.0 ({version_output}), reinstalling..."
-            )
-            venv_conan = None
-
-    if venv_conan is None:
-        build_run(f'"{venv_python}" -m pip install conan==2.14.0')
-        venv_conan = scripts_dir / "conan"
-        if not venv_conan.exists():
-            raise RuntimeError(
-                f"Failed to locate conan executable in virtual environment {scripts_dir} after installation."
-            )
 
     # Create default profile
     build_run(f'"{venv_conan}" profile detect -f')

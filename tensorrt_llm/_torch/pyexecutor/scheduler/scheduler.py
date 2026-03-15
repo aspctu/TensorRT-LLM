@@ -14,7 +14,6 @@ from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
 from ..llm_request import LlmRequest, LlmRequestState
-from ..scheduler_fairness import SchedulerFairnessController
 
 RequestList = list[LlmRequest]
 
@@ -383,7 +382,6 @@ class SimpleScheduler(RequestScheduler):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
-        self.fairness_controller = SchedulerFairnessController()
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -1481,7 +1479,6 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
         capacity = scheduler_capacity if scheduler_capacity is not None else max_batch_size
 
-        self.fairness_controller = SchedulerFairnessController()
         self.capacity_scheduler = PyCapacityScheduler(
             max_num_requests=capacity,
             kv_cache_manager=kv_cache_manager,

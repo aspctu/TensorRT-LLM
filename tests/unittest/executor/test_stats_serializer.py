@@ -1,6 +1,6 @@
 import json
 
-from tensorrt_llm._torch.pyexecutor.scheduler_fairness import RequestStatsExtra
+from tensorrt_llm._torch.pyexecutor.request_metadata import RequestStatsExtra
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor.base_worker import BaseWorker
 
@@ -31,13 +31,8 @@ def test_stats_serializer_includes_priority_metrics():
                     }
                 },
                 "organizationStats": {
-                    "2:acme": {
-                        "priorityTier": 2,
-                        "organizationId": "acme",
-                        "active": 1,
-                        "orgTokenBalance": -48.0,
-                        "totalScheduledTokens": 48.0,
-                    }
+                    "active": {"2:acme": 1},
+                    "queued": {"0:default": 1},
                 },
                 "requestStatsExtra": {
                     42: RequestStatsExtra(
@@ -59,7 +54,7 @@ def test_stats_serializer_includes_priority_metrics():
     assert stats["priorityStats"]["queued"] == {"0": 1}
     assert stats["tierStats"]["2"]["ttftMsP95"] == 1250.0
     assert stats["tierStats"]["2"]["generatedTokensPerSecond"] == 32.0
-    assert stats["organizationStats"]["2:acme"]["orgTokenBalance"] == -48.0
+    assert stats["organizationStats"]["active"] == {"2:acme": 1}
     assert stats["requestStats"][0]["id"] == 42
     assert stats["requestStats"][0]["priorityTier"] == 2
     assert stats["requestStats"][0]["priorityCredit"] == 3.0

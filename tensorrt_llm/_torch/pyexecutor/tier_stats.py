@@ -2,8 +2,8 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Iterable, Optional
 
+from .request_metadata import request_priority_tier, scheduled_token_cost
 from .scheduler import ScheduledRequests
-from .scheduler_fairness import request_priority_tier, scheduled_token_cost
 
 LATENCY_SAMPLE_LIMIT = 256
 THROUGHPUT_WINDOW_SECONDS = 30.0
